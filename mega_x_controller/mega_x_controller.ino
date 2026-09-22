@@ -1,1020 +1,397 @@
-#include <AccelStepper.h>
+/*
+  Milestone 1: Arduino Mega XYZ manual-motion foundation.
 
-// ============================================================
-// X AXIS CONTROLLER - ARDUINO MEGA
-// ============================================================
-//
-// X STEP  = 2
-// X DIR   = 3
-// X-      = 22   <-- ALSO USED AS HOME / ZERO
-// X+      = 24
-//
-// LOW  = triggered
-// HIGH = not triggered
-//
-// Lead screw: 10 mm/rev
-// Driver:     1600 pulses/rev
-//
-// 160 steps/mm
-// 0.00625 mm/step
-//
-// Coordinate system:
-//
-// X- = 0.000 mm
-// Moving toward X+ = positive position
-//
-// ============================================================
+  Scope: position reporting, jog, relative move, immediate software STOP,
+  six limit inputs, dual-Y synchronized STEP pulses, and a serial watchdog.
+  Position is open-loop session position; homing is intentionally not included.
+*/
 
+#include <Arduino.h>
+#include <math.h>
+#include <stdlib.h>
+#include <string.h>
 
-// ============================================================
-// PINS
-// ============================================================
+const char CONTROLLER_ID[] = "MEGA_GANTRY_M1";
 
-const int X_STEP  = 2;
-const int X_DIR   = 3;
+const uint8_t X_STEP = 2;
+const uint8_t X_DIR = 3;
+const uint8_t Z_STEP = 4;
+const uint8_t Z_DIR = 5;
+const uint8_t Y1_STEP = 6;
+const uint8_t Y1_DIR = 7;
+const uint8_t Y_MINUS = 8;
+const uint8_t Y_PLUS = 10;
+const uint8_t Y2_STEP = 11;
+const uint8_t Y2_DIR = 12;
+const uint8_t X_MINUS = 22;
+const uint8_t X_PLUS = 24;
+const uint8_t Z_MINUS = 25;
+const uint8_t Z_PLUS = 28;
 
-const int X_MINUS = 22;
-const int X_PLUS  = 24;
+const float STEPS_PER_MM = 160.0f;
+const float DEFAULT_SPEED_MM_S = 2.0f;
+const float MIN_SPEED_MM_S = 0.05f;
+const float MAX_SPEED_MM_S = 20.0f;
+const unsigned int STEP_PULSE_US = 5;
+const unsigned int DIR_SETUP_US = 10;
+const unsigned long STATUS_INTERVAL_MS = 100;
+const unsigned long COMMAND_WATCHDOG_MS = 750;
+const size_t COMMAND_BUFFER_SIZE = 96;
 
-
-// ============================================================
-// MECHANICS
-// ============================================================
-
-const float STEPS_PER_MM = 160.0;
-
-
-// ============================================================
-// DIRECTION
-//
-// Your actual motor direction is reversed.
-//
-// Software +X must physically move toward X+.
-// Software -X must physically move toward X-.
-//
-// ============================================================
-
-const int X_DIR_SIGN = -1;
-
-
-// ============================================================
-// STEPPER
-// ============================================================
-
-AccelStepper xMotor(
-    AccelStepper::DRIVER,
-    X_STEP,
-    X_DIR
-);
-
-
-// ============================================================
-// MOTION SETTINGS
-// ============================================================
-
-float speedMM = 1.0;     // mm/s
-float accelMM = 3.0;     // mm/s^2
-
-
-// ============================================================
-// MOTION MODE
-// ============================================================
-
-enum MotionMode
-{
-    MODE_IDLE,
-    MODE_MOVE,
-    MODE_JOG,
-    MODE_HOME
+enum MotionMode {
+  MODE_IDLE,
+  MODE_JOG,
+  MODE_MOVE
 };
 
-MotionMode mode = MODE_IDLE;
+struct AxisState {
+  char name;
+  long positionSteps;
+  unsigned long remainingSteps;
+  int8_t direction;
+  MotionMode mode;
+  unsigned long nextStepMicros;
+};
 
+AxisState xAxis = {'X', 0, 0, 0, MODE_IDLE, 0};
+AxisState yAxis = {'Y', 0, 0, 0, MODE_IDLE, 0};
+AxisState zAxis = {'Z', 0, 0, 0, MODE_IDLE, 0};
 
-// ============================================================
-// JOG DIRECTION
-//
-// +1 = toward X+
-// -1 = toward X-
-//
-// ============================================================
+float speedMM = DEFAULT_SPEED_MM_S;
+unsigned long stepIntervalMicros = 3125;
+unsigned long lastStatusMillis = 0;
+unsigned long lastCommandMillis = 0;
+char commandBuffer[COMMAND_BUFFER_SIZE];
+size_t commandLength = 0;
 
-int jogDirection = 0;
-
-
-// ============================================================
-// SERIAL
-// ============================================================
-
-String commandBuffer = "";
-
-unsigned long lastStatusTime = 0;
-
-const unsigned long STATUS_INTERVAL = 100;
-
-
-// ============================================================
-// FUNCTION DECLARATIONS
-//
-// Explicit declarations avoid Arduino/C++ ordering problems.
-// ============================================================
-
-bool xMinusTriggered();
-bool xPlusTriggered();
-
-void applyMotionSettings();
-
-float getXPositionMM();
-
-bool movementAllowed(int softwareDirection);
-
-void stopMotor();
-
-void startRelativeMove(float mm);
-void updateMove();
-
-void startJog(int direction);
-void updateJog();
-
-void startHome();
-void updateHome();
-
-void sendStatus(bool force);
-
-void processCommand(String cmd);
-void readSerial();
-
-
-// ============================================================
-// LIMIT SWITCHES
-// ============================================================
-
-bool xMinusTriggered()
-{
-    return digitalRead(X_MINUS) == LOW;
+bool limitTriggered(uint8_t pin) {
+  return digitalRead(pin) == LOW;
 }
 
-
-bool xPlusTriggered()
-{
-    return digitalRead(X_PLUS) == LOW;
+AxisState *axisFromName(const char *token) {
+  if (token == NULL || token[1] != '\0') return NULL;
+  if (token[0] == 'X') return &xAxis;
+  if (token[0] == 'Y') return &yAxis;
+  if (token[0] == 'Z') return &zAxis;
+  return NULL;
 }
 
-
-// ============================================================
-// SPEED / ACCELERATION
-// ============================================================
-
-void applyMotionSettings()
-{
-    xMotor.setMaxSpeed(
-        speedMM * STEPS_PER_MM
-    );
-
-    xMotor.setAcceleration(
-        accelMM * STEPS_PER_MM
-    );
+bool axisIsMoving(const AxisState &axis) {
+  return axis.mode != MODE_IDLE;
 }
 
-
-// ============================================================
-// POSITION
-//
-// AccelStepper stores MOTOR coordinates.
-//
-// Convert motor coordinates into our SOFTWARE X coordinates.
-//
-// ============================================================
-
-float getXPositionMM()
-{
-    float motorMM =
-        (float)xMotor.currentPosition()
-        /
-        STEPS_PER_MM;
-
-    return motorMM * X_DIR_SIGN;
+bool anyAxisMoving() {
+  return axisIsMoving(xAxis) || axisIsMoving(yAxis) || axisIsMoving(zAxis);
 }
 
-
-// ============================================================
-// LIMIT CHECK
-//
-// +1 = trying to move toward X+
-// -1 = trying to move toward X-
-//
-// A triggered limit ONLY blocks movement further INTO it.
-//
-// Example:
-//
-// X- triggered:
-//     X- blocked
-//     X+ allowed
-//
-// ============================================================
-
-bool movementAllowed(int softwareDirection)
-{
-    if (softwareDirection > 0)
-    {
-        if (xPlusTriggered())
-        {
-            return false;
-        }
-    }
-
-
-    if (softwareDirection < 0)
-    {
-        if (xMinusTriggered())
-        {
-            return false;
-        }
-    }
-
-
-    return true;
+bool movementAllowed(const AxisState &axis, int8_t direction) {
+  if (axis.name == 'X') {
+    return direction > 0 ? !limitTriggered(X_PLUS) : !limitTriggered(X_MINUS);
+  }
+  if (axis.name == 'Y') {
+    return direction > 0 ? !limitTriggered(Y_PLUS) : !limitTriggered(Y_MINUS);
+  }
+  return direction > 0 ? !limitTriggered(Z_PLUS) : !limitTriggered(Z_MINUS);
 }
 
-
-// ============================================================
-// IMMEDIATE STOP
-// ============================================================
-
-void stopMotor()
-{
-    mode = MODE_IDLE;
-
-    jogDirection = 0;
-
-    xMotor.setSpeed(0);
-
-    xMotor.moveTo(
-        xMotor.currentPosition()
-    );
+const char *activeLimitName(const AxisState &axis, int8_t direction) {
+  if (axis.name == 'X') return direction > 0 ? "XPLUS" : "XMIN";
+  if (axis.name == 'Y') return direction > 0 ? "YPLUS" : "YMIN";
+  return direction > 0 ? "ZPLUS" : "ZMIN";
 }
 
-
-// ============================================================
-// RELATIVE MOVE
-//
-// MOVE -10
-// MOVE -1
-// MOVE +1
-// MOVE +10
-//
-// Uses BOTH:
-// speedMM
-// accelMM
-//
-// ============================================================
-
-void startRelativeMove(float mm)
-{
-    if (mm == 0.0)
-    {
-        return;
-    }
-
-
-    int softwareDirection;
-
-    if (mm > 0)
-    {
-        softwareDirection = +1;
-    }
-    else
-    {
-        softwareDirection = -1;
-    }
-
-
-    // Check limit before starting
-
-    if (!movementAllowed(softwareDirection))
-    {
-        Serial.println("ERROR,LIMIT_BLOCKED");
-
-        return;
-    }
-
-
-    // Cancel previous motion
-
-    stopMotor();
-
-
-    // Apply current UI speed / acceleration
-
-    applyMotionSettings();
-
-
-    // Convert mm -> software steps
-
-    long softwareSteps =
-        lround(
-            mm * STEPS_PER_MM
-        );
-
-
-    // Convert software direction -> motor direction
-
-    long motorSteps =
-        softwareSteps * X_DIR_SIGN;
-
-
-    xMotor.move(
-        motorSteps
-    );
-
-
-    mode = MODE_MOVE;
+void setAxisDirection(const AxisState &axis, int8_t direction) {
+  // Confirmed convention: X+ LOW, Y+ HIGH, Z+ downward LOW.
+  if (axis.name == 'X') {
+    digitalWrite(X_DIR, direction > 0 ? LOW : HIGH);
+  } else if (axis.name == 'Y') {
+    uint8_t level = direction > 0 ? HIGH : LOW;
+    digitalWrite(Y1_DIR, level);
+    digitalWrite(Y2_DIR, level);
+  } else {
+    digitalWrite(Z_DIR, direction > 0 ? LOW : HIGH);
+  }
 }
 
-
-// ============================================================
-// UPDATE RELATIVE MOVE
-// ============================================================
-
-void updateMove()
-{
-    if (mode != MODE_MOVE)
-    {
-        return;
-    }
-
-
-    long remaining =
-        xMotor.distanceToGo();
-
-
-    // Finished
-
-    if (remaining == 0)
-    {
-        mode = MODE_IDLE;
-
-        return;
-    }
-
-
-    // Determine MOTOR direction
-
-    int motorDirection;
-
-    if (remaining > 0)
-    {
-        motorDirection = +1;
-    }
-    else
-    {
-        motorDirection = -1;
-    }
-
-
-    // Convert MOTOR direction back to SOFTWARE direction
-
-    int softwareDirection =
-        motorDirection * X_DIR_SIGN;
-
-
-    // Check corresponding limit continuously
-
-    if (!movementAllowed(softwareDirection))
-    {
-        stopMotor();
-
-        Serial.println("LIMIT_STOP");
-
-        return;
-    }
-
-
-    // Acceleration controlled movement
-
-    xMotor.run();
+void pulseAxis(const AxisState &axis) {
+  if (axis.name == 'X') {
+    digitalWrite(X_STEP, HIGH);
+    delayMicroseconds(STEP_PULSE_US);
+    digitalWrite(X_STEP, LOW);
+  } else if (axis.name == 'Y') {
+    digitalWrite(Y1_STEP, HIGH);
+    digitalWrite(Y2_STEP, HIGH);
+    delayMicroseconds(STEP_PULSE_US);
+    digitalWrite(Y1_STEP, LOW);
+    digitalWrite(Y2_STEP, LOW);
+  } else {
+    digitalWrite(Z_STEP, HIGH);
+    delayMicroseconds(STEP_PULSE_US);
+    digitalWrite(Z_STEP, LOW);
+  }
 }
 
-
-// ============================================================
-// START JOG
-//
-// JOG X+
-// JOG X-
-//
-// ============================================================
-
-void startJog(int direction)
-{
-    // Check limit
-
-    if (!movementAllowed(direction))
-    {
-        Serial.println("ERROR,LIMIT_BLOCKED");
-
-        return;
-    }
-
-
-    // Cancel previous movement
-
-    stopMotor();
-
-
-    jogDirection = direction;
-
-
-    // Convert UI speed to step/s
-
-    float motorSpeed =
-        speedMM
-        *
-        STEPS_PER_MM
-        *
-        direction
-        *
-        X_DIR_SIGN;
-
-
-    xMotor.setSpeed(
-        motorSpeed
-    );
-
-
-    mode = MODE_JOG;
+void stopAxis(AxisState &axis) {
+  axis.mode = MODE_IDLE;
+  axis.remainingSteps = 0;
+  axis.direction = 0;
 }
 
-
-// ============================================================
-// UPDATE JOG
-// ============================================================
-
-void updateJog()
-{
-    if (mode != MODE_JOG)
-    {
-        return;
-    }
-
-
-    // Check limit continuously
-
-    if (!movementAllowed(jogDirection))
-    {
-        stopMotor();
-
-        Serial.println("LIMIT_STOP");
-
-        return;
-    }
-
-
-    // Constant-speed jogging
-
-    xMotor.runSpeed();
+void stopAll() {
+  stopAxis(xAxis);
+  stopAxis(yAxis);
+  stopAxis(zAxis);
+  digitalWrite(X_STEP, LOW);
+  digitalWrite(Y1_STEP, LOW);
+  digitalWrite(Y2_STEP, LOW);
+  digitalWrite(Z_STEP, LOW);
 }
 
-
-// ============================================================
-// START HOME
-//
-// IMPORTANT:
-//
-// X- IS HOME.
-//
-// HOME command:
-//
-// current position
-//       ↓
-// move toward X-
-//       ↓
-// X- becomes LOW
-//       ↓
-// STOP
-//       ↓
-// setCurrentPosition(0)
-//
-// ============================================================
-
-void startHome()
-{
-    // Stop any existing movement first
-
-    stopMotor();
-
-
-    // --------------------------------------------------------
-    // Already touching X-
-    //
-    // Then we are already at HOME.
-    // Set zero immediately.
-    // --------------------------------------------------------
-
-    if (xMinusTriggered())
-    {
-        xMotor.setCurrentPosition(0);
-
-        mode = MODE_IDLE;
-
-
-        Serial.println("HOME_DONE");
-
-
-        sendStatus(true);
-
-
-        return;
-    }
-
-
-    // Apply UI speed / acceleration
-
-    applyMotionSettings();
-
-
-    // --------------------------------------------------------
-    // Move toward SOFTWARE X-
-    //
-    // Give it a very large relative distance.
-    // X- switch will terminate movement.
-    // --------------------------------------------------------
-
-    long softwareSteps =
-        -1000L * 160L;
-
-
-    long motorSteps =
-        softwareSteps * X_DIR_SIGN;
-
-
-    xMotor.move(
-        motorSteps
-    );
-
-
-    mode = MODE_HOME;
+bool startJog(AxisState &axis, int8_t direction) {
+  if (!movementAllowed(axis, direction)) {
+    Serial.print(F("ERROR,LIMIT_BLOCKED,"));
+    Serial.print(axis.name);
+    Serial.print(',');
+    Serial.println(activeLimitName(axis, direction));
+    return false;
+  }
+  stopAll();
+  axis.direction = direction;
+  setAxisDirection(axis, direction);
+  axis.nextStepMicros = micros() + DIR_SETUP_US;
+  axis.mode = MODE_JOG;
+  return true;
 }
 
-
-// ============================================================
-// UPDATE HOME
-// ============================================================
-
-void updateHome()
-{
-    if (mode != MODE_HOME)
-    {
-        return;
-    }
-
-
-    // --------------------------------------------------------
-    // X- TRIGGERED
-    //
-    // THIS IS HOME.
-    // --------------------------------------------------------
-
-    if (xMinusTriggered())
-    {
-        // Stop pulse generation
-
-        xMotor.setSpeed(0);
-
-
-        // Cancel old target
-
-        xMotor.moveTo(
-            xMotor.currentPosition()
-        );
-
-
-        // ====================================================
-        // SET HOME = EXACTLY ZERO
-        // ====================================================
-
-        xMotor.setCurrentPosition(0);
-
-
-        mode = MODE_IDLE;
-
-
-        Serial.println("HOME_DONE");
-
-
-        // Force immediate UI update
-
-        sendStatus(true);
-
-
-        return;
-    }
-
-
-    // Continue acceleration-controlled HOME motion
-
-    xMotor.run();
+bool startRelativeMove(AxisState &axis, float distanceMM) {
+  long signedSteps = lround(distanceMM * STEPS_PER_MM);
+  if (signedSteps == 0) {
+    Serial.println(F("ERROR,MOVE_TOO_SMALL"));
+    return false;
+  }
+  int8_t direction = signedSteps > 0 ? 1 : -1;
+  if (!movementAllowed(axis, direction)) {
+    Serial.print(F("ERROR,LIMIT_BLOCKED,"));
+    Serial.print(axis.name);
+    Serial.print(',');
+    Serial.println(activeLimitName(axis, direction));
+    return false;
+  }
+  stopAll();
+  axis.direction = direction;
+  axis.remainingSteps = static_cast<unsigned long>(labs(signedSteps));
+  setAxisDirection(axis, direction);
+  axis.nextStepMicros = micros() + DIR_SETUP_US;
+  axis.mode = MODE_MOVE;
+  return true;
 }
 
+void updateAxis(AxisState &axis) {
+  if (axis.mode == MODE_IDLE) return;
 
-// ============================================================
-// STATUS
-// ============================================================
+  if (!movementAllowed(axis, axis.direction)) {
+    const char *limitName = activeLimitName(axis, axis.direction);
+    stopAxis(axis);
+    Serial.print(F("EVENT,LIMIT_STOP,"));
+    Serial.print(axis.name);
+    Serial.print(',');
+    Serial.println(limitName);
+    return;
+  }
 
-void sendStatus(bool force)
-{
-    if (!force)
-    {
-        if (
-            millis() - lastStatusTime
-            <
-            STATUS_INTERVAL
-        )
-        {
-            return;
-        }
-    }
+  unsigned long now = micros();
+  if (static_cast<long>(now - axis.nextStepMicros) < 0) return;
 
+  pulseAxis(axis);
+  axis.positionSteps += axis.direction;
+  axis.nextStepMicros = now + stepIntervalMicros;
 
-    lastStatusTime = millis();
-
-
-    // Position
-
-    Serial.print("STATUS,X=");
-
-    Serial.print(
-        getXPositionMM(),
-        3
-    );
-
-
-    // X-
-
-    Serial.print(",XMIN=");
-
-    Serial.print(
-        xMinusTriggered()
-        ? 1
-        : 0
-    );
-
-
-    // X+
-
-    Serial.print(",XPLUS=");
-
-    Serial.print(
-        xPlusTriggered()
-        ? 1
-        : 0
-    );
-
-
-    // HOME
-    //
-    // Since X- IS HOME,
-    // HOME status = X- status.
-
-    Serial.print(",HOME=");
-
-    Serial.print(
-        xMinusTriggered()
-        ? 1
-        : 0
-    );
-
-
-    // Moving
-
-    Serial.print(",MOVING=");
-
-    Serial.println(
-        mode == MODE_IDLE
-        ? 0
-        : 1
-    );
+  if (axis.mode == MODE_MOVE) {
+    if (axis.remainingSteps > 0) axis.remainingSteps--;
+    if (axis.remainingSteps == 0) stopAxis(axis);
+  }
 }
 
-
-// ============================================================
-// COMMAND PROCESSOR
-// ============================================================
-
-void processCommand(String cmd)
-{
-    cmd.trim();
-
-
-    // --------------------------------------------------------
-    // STOP
-    // --------------------------------------------------------
-
-    if (cmd == "STOP")
-    {
-        stopMotor();
-
-        Serial.println("OK,STOP");
-
-        return;
-    }
-
-
-    // --------------------------------------------------------
-    // JOG X+
-    // --------------------------------------------------------
-
-    if (cmd == "JOG X+")
-    {
-        startJog(+1);
-
-        Serial.println("OK,JOG_X_PLUS");
-
-        return;
-    }
-
-
-    // --------------------------------------------------------
-    // JOG X-
-    // --------------------------------------------------------
-
-    if (cmd == "JOG X-")
-    {
-        startJog(-1);
-
-        Serial.println("OK,JOG_X_MINUS");
-
-        return;
-    }
-
-
-    // --------------------------------------------------------
-    // JOG STOP
-    // --------------------------------------------------------
-
-    if (cmd == "JOG STOP")
-    {
-        stopMotor();
-
-        Serial.println("OK,JOG_STOP");
-
-        return;
-    }
-
-
-    // --------------------------------------------------------
-    // MOVE
-    //
-    // MOVE -10
-    // MOVE -1
-    // MOVE 1
-    // MOVE 10
-    //
-    // --------------------------------------------------------
-
-    if (cmd.startsWith("MOVE "))
-    {
-        float mm =
-            cmd.substring(5).toFloat();
-
-
-        startRelativeMove(mm);
-
-
-        Serial.print("OK,MOVE,");
-
-        Serial.println(mm);
-
-
-        return;
-    }
-
-
-    // --------------------------------------------------------
-    // SPEED
-    //
-    // Unit = mm/s
-    // --------------------------------------------------------
-
-    if (cmd.startsWith("SPEED "))
-    {
-        float value =
-            cmd.substring(6).toFloat();
-
-
-        if (
-            value > 0
-            &&
-            value <= 50
-        )
-        {
-            speedMM = value;
-
-
-            applyMotionSettings();
-
-
-            // If currently jogging,
-            // update jog speed immediately.
-
-            if (mode == MODE_JOG)
-            {
-                float motorSpeed =
-                    speedMM
-                    *
-                    STEPS_PER_MM
-                    *
-                    jogDirection
-                    *
-                    X_DIR_SIGN;
-
-
-                xMotor.setSpeed(
-                    motorSpeed
-                );
-            }
-
-
-            Serial.print("OK,SPEED,");
-
-            Serial.println(speedMM);
-        }
-
-
-        return;
-    }
-
-
-    // --------------------------------------------------------
-    // ACCEL
-    //
-    // Unit = mm/s^2
-    // --------------------------------------------------------
-
-    if (cmd.startsWith("ACCEL "))
-    {
-        float value =
-            cmd.substring(6).toFloat();
-
-
-        if (
-            value > 0
-            &&
-            value <= 500
-        )
-        {
-            accelMM = value;
-
-
-            applyMotionSettings();
-
-
-            Serial.print("OK,ACCEL,");
-
-            Serial.println(accelMM);
-        }
-
-
-        return;
-    }
-
-
-    // --------------------------------------------------------
-    // HOME
-    // --------------------------------------------------------
-
-    if (cmd == "HOME")
-    {
-        startHome();
-
-        Serial.println("OK,HOME");
-
-        return;
-    }
-
-
-    // --------------------------------------------------------
-    // UNKNOWN COMMAND
-    // --------------------------------------------------------
-
-    Serial.print("ERROR,UNKNOWN,");
-
-    Serial.println(cmd);
+void applySpeed(float newSpeedMM) {
+  speedMM = newSpeedMM;
+  float stepsPerSecond = speedMM * STEPS_PER_MM;
+  stepIntervalMicros = static_cast<unsigned long>(1000000.0f / stepsPerSecond);
+  if (stepIntervalMicros <= STEP_PULSE_US) {
+    stepIntervalMicros = STEP_PULSE_US + 1;
+  }
 }
 
-
-// ============================================================
-// SERIAL READER
-// ============================================================
-
-void readSerial()
-{
-    while (Serial.available() > 0)
-    {
-        char c =
-            Serial.read();
-
-
-        // Complete command
-
-        if (c == '\n')
-        {
-            processCommand(
-                commandBuffer
-            );
-
-
-            commandBuffer = "";
-
-
-            continue;
-        }
-
-
-        // Ignore CR
-
-        if (c != '\r')
-        {
-            commandBuffer += c;
-        }
-    }
+void printPosition(const AxisState &axis) {
+  Serial.print(static_cast<float>(axis.positionSteps) / STEPS_PER_MM, 3);
 }
 
+void sendStatus(bool force) {
+  unsigned long now = millis();
+  if (!force && now - lastStatusMillis < STATUS_INTERVAL_MS) return;
+  lastStatusMillis = now;
 
-// ============================================================
-// SETUP
-// ============================================================
+  Serial.print(F("STATUS,X="));
+  printPosition(xAxis);
+  Serial.print(F(",Y="));
+  printPosition(yAxis);
+  Serial.print(F(",Z="));
+  printPosition(zAxis);
+  // Compact fields keep this periodic line below the Mega serial TX buffer.
+  // L order: X-, X+, Y-, Y+, Z-, Z+. M order: X, Y, Z.
+  Serial.print(F(",L="));
+  Serial.print(limitTriggered(X_MINUS) ? 1 : 0);
+  Serial.print(limitTriggered(X_PLUS) ? 1 : 0);
+  Serial.print(limitTriggered(Y_MINUS) ? 1 : 0);
+  Serial.print(limitTriggered(Y_PLUS) ? 1 : 0);
+  Serial.print(limitTriggered(Z_MINUS) ? 1 : 0);
+  Serial.print(limitTriggered(Z_PLUS) ? 1 : 0);
+  Serial.print(F(",M="));
+  Serial.print(axisIsMoving(xAxis) ? 1 : 0);
+  Serial.print(axisIsMoving(yAxis) ? 1 : 0);
+  Serial.println(axisIsMoving(zAxis) ? 1 : 0);
+}
 
-void setup()
-{
-    Serial.begin(115200);
+bool parseFloatStrict(const char *token, float &value) {
+  if (token == NULL || token[0] == '\0') return false;
+  char *endPointer = NULL;
+  value = strtod(token, &endPointer);
+  return endPointer != token && *endPointer == '\0';
+}
 
+void processCommand(char *command) {
+  lastCommandMillis = millis();
 
-    // Limits
+  char *savePointer = NULL;
+  char *verb = strtok_r(command, " ", &savePointer);
+  if (verb == NULL) return;
 
-    pinMode(
-        X_MINUS,
-        INPUT_PULLUP
-    );
-
-
-    pinMode(
-        X_PLUS,
-        INPUT_PULLUP
-    );
-
-
-    // Step pulse width
-
-    xMotor.setMinPulseWidth(5);
-
-
-    // Initial speed settings
-
-    applyMotionSettings();
-
-
-    Serial.println(
-        "X_CONTROLLER_READY"
-    );
-
-
+  if (strcmp(verb, "HELLO") == 0) {
+    Serial.print(F("IDENTITY,"));
+    Serial.println(CONTROLLER_ID);
+    return;
+  }
+  if (strcmp(verb, "KEEPALIVE") == 0) return;
+  if (strcmp(verb, "STATUS") == 0) {
     sendStatus(true);
+    return;
+  }
+  if (strcmp(verb, "STOP") == 0) {
+    stopAll();
+    Serial.println(F("OK,STOP"));
+    sendStatus(true);
+    return;
+  }
+  if (strcmp(verb, "SPEED") == 0) {
+    float requestedSpeed;
+    if (!parseFloatStrict(strtok_r(NULL, " ", &savePointer), requestedSpeed) ||
+        requestedSpeed < MIN_SPEED_MM_S || requestedSpeed > MAX_SPEED_MM_S) {
+      Serial.println(F("ERROR,BAD_SPEED"));
+      return;
+    }
+    applySpeed(requestedSpeed);
+    Serial.print(F("OK,SPEED,"));
+    Serial.println(speedMM, 3);
+    return;
+  }
+  if (strcmp(verb, "JOG") == 0) {
+    AxisState *axis = axisFromName(strtok_r(NULL, " ", &savePointer));
+    char *directionToken = strtok_r(NULL, " ", &savePointer);
+    if (axis == NULL || directionToken == NULL || directionToken[1] != '\0' ||
+        (directionToken[0] != '+' && directionToken[0] != '-')) {
+      Serial.println(F("ERROR,BAD_JOG"));
+      return;
+    }
+    int8_t direction = directionToken[0] == '+' ? 1 : -1;
+    if (startJog(*axis, direction)) {
+      Serial.print(F("OK,JOG,"));
+      Serial.print(axis->name);
+      Serial.print(',');
+      Serial.println(directionToken);
+    }
+    return;
+  }
+  if (strcmp(verb, "MOVE") == 0) {
+    AxisState *axis = axisFromName(strtok_r(NULL, " ", &savePointer));
+    float distanceMM;
+    if (axis == NULL ||
+        !parseFloatStrict(strtok_r(NULL, " ", &savePointer), distanceMM) ||
+        distanceMM == 0.0f || abs(distanceMM) > 1000.0f) {
+      Serial.println(F("ERROR,BAD_MOVE"));
+      return;
+    }
+    if (startRelativeMove(*axis, distanceMM)) {
+      Serial.print(F("OK,MOVE,"));
+      Serial.print(axis->name);
+      Serial.print(',');
+      Serial.println(distanceMM, 3);
+    }
+    return;
+  }
+
+  Serial.println(F("ERROR,UNKNOWN_COMMAND"));
 }
 
-
-// ============================================================
-// LOOP
-// ============================================================
-
-void loop()
-{
-    // Always process serial first.
-    // STOP therefore has priority.
-
-    readSerial();
-
-
-    // --------------------------------------------------------
-    // Motion state machine
-    // --------------------------------------------------------
-
-    if (mode == MODE_JOG)
-    {
-        updateJog();
+void readSerial() {
+  while (Serial.available() > 0) {
+    char incoming = static_cast<char>(Serial.read());
+    if (incoming == '\n' || incoming == '\r') {
+      if (commandLength > 0) {
+        commandBuffer[commandLength] = '\0';
+        processCommand(commandBuffer);
+        commandLength = 0;
+      }
+    } else if (commandLength < COMMAND_BUFFER_SIZE - 1) {
+      if (incoming >= 'a' && incoming <= 'z') incoming -= 32;
+      commandBuffer[commandLength++] = incoming;
+    } else {
+      commandLength = 0;
+      Serial.println(F("ERROR,COMMAND_TOO_LONG"));
     }
+  }
+}
 
-    else if (mode == MODE_MOVE)
-    {
-        updateMove();
-    }
+void setup() {
+  Serial.begin(115200);
 
-    else if (mode == MODE_HOME)
-    {
-        updateHome();
-    }
+  pinMode(X_STEP, OUTPUT);
+  pinMode(X_DIR, OUTPUT);
+  pinMode(Y1_STEP, OUTPUT);
+  pinMode(Y1_DIR, OUTPUT);
+  pinMode(Y2_STEP, OUTPUT);
+  pinMode(Y2_DIR, OUTPUT);
+  pinMode(Z_STEP, OUTPUT);
+  pinMode(Z_DIR, OUTPUT);
 
+  digitalWrite(X_STEP, LOW);
+  digitalWrite(Y1_STEP, LOW);
+  digitalWrite(Y2_STEP, LOW);
+  digitalWrite(Z_STEP, LOW);
 
-    // 10 Hz UI status
+  pinMode(X_MINUS, INPUT_PULLUP);
+  pinMode(X_PLUS, INPUT_PULLUP);
+  pinMode(Y_MINUS, INPUT_PULLUP);
+  pinMode(Y_PLUS, INPUT_PULLUP);
+  pinMode(Z_MINUS, INPUT_PULLUP);
+  pinMode(Z_PLUS, INPUT_PULLUP);
 
-    sendStatus(false);
+  applySpeed(DEFAULT_SPEED_MM_S);
+  lastCommandMillis = millis();
+  Serial.print(F("READY,"));
+  Serial.println(CONTROLLER_ID);
+  sendStatus(true);
+}
+
+void loop() {
+  readSerial();
+
+  if (anyAxisMoving() && millis() - lastCommandMillis > COMMAND_WATCHDOG_MS) {
+    stopAll();
+    Serial.println(F("EVENT,WATCHDOG_STOP"));
+    sendStatus(true);
+  }
+
+  updateAxis(xAxis);
+  updateAxis(yAxis);
+  updateAxis(zAxis);
+  sendStatus(false);
 }

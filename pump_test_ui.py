@@ -23,6 +23,7 @@ from PySide6.QtWidgets import (
 BAUD_RATE = 115200
 DEFAULT_RPM = 2.0
 DEFAULT_ACCELERATION = 5.0
+DEFAULT_PULSES_PER_REV = 1600
 
 
 class PumpPanel(QGroupBox):
@@ -53,6 +54,13 @@ class PumpPanel(QGroupBox):
         self.acceleration_box.setValue(DEFAULT_ACCELERATION)
         self.acceleration_box.setSuffix(" rpm/s")
 
+        self.pulses_per_rev_box = QDoubleSpinBox()
+        self.pulses_per_rev_box.setRange(1.0, 100000.0)
+        self.pulses_per_rev_box.setDecimals(0)
+        self.pulses_per_rev_box.setSingleStep(100.0)
+        self.pulses_per_rev_box.setValue(DEFAULT_PULSES_PER_REV)
+        self.pulses_per_rev_box.setSuffix(" pulses/rev")
+
         self.apply_button = QPushButton("APPLY SETTINGS")
         self.start_button = QPushButton("START")
         self.stop_button = QPushButton("STOP")
@@ -66,9 +74,11 @@ class PumpPanel(QGroupBox):
         layout.addWidget(self.rpm_box, 1, 1)
         layout.addWidget(QLabel("Acceleration:"), 2, 0)
         layout.addWidget(self.acceleration_box, 2, 1)
-        layout.addWidget(self.apply_button, 3, 0, 1, 2)
-        layout.addWidget(self.start_button, 4, 0)
-        layout.addWidget(self.stop_button, 4, 1)
+        layout.addWidget(QLabel("Motor resolution:"), 3, 0)
+        layout.addWidget(self.pulses_per_rev_box, 3, 1)
+        layout.addWidget(self.apply_button, 4, 0, 1, 2)
+        layout.addWidget(self.start_button, 5, 0)
+        layout.addWidget(self.stop_button, 5, 1)
 
         self.set_running(False)
         self.set_controls_enabled(False)
@@ -76,6 +86,7 @@ class PumpPanel(QGroupBox):
     def set_controls_enabled(self, enabled: bool):
         self.rpm_box.setEnabled(enabled)
         self.acceleration_box.setEnabled(enabled)
+        self.pulses_per_rev_box.setEnabled(enabled)
         self.apply_button.setEnabled(enabled)
         self.start_button.setEnabled(enabled)
         self.stop_button.setEnabled(enabled)
@@ -95,7 +106,9 @@ class PumpPanel(QGroupBox):
     def apply_settings(self) -> bool:
         rpm = self.rpm_box.value()
         acceleration = self.acceleration_box.value()
+        pulses_per_rev = self.pulses_per_rev_box.value()
         commands = [
+            f"SET {self.pump_id} PPR {pulses_per_rev:.0f}",
             f"SET {self.pump_id} MAXRPM {rpm:.3f}",
             f"SET {self.pump_id} ACC {acceleration:.3f}",
         ]
@@ -168,7 +181,7 @@ class PumpTestUI(QWidget):
         self.stop_all_button = QPushButton("STOP BOTH")
         self.stop_all_button.setMinimumHeight(48)
         self.stop_all_button.clicked.connect(self.stop_all)
-        self.emergency_button = QPushButton("EMERGENCY STOP")
+        self.emergency_button = QPushButton("SOFTWARE STOP ALL")
         self.emergency_button.setMinimumHeight(48)
         self.emergency_button.setStyleSheet(
             "background: #c62828; color: white; font-size: 16px; font-weight: bold;"

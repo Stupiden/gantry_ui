@@ -1,1272 +1,558 @@
+"""Milestone 1: manual XYZ motion control for the Arduino Mega gantry."""
+
 import sys
+import time
+import tkinter as tk
+from tkinter import messagebox, ttk
+
 import serial
 import serial.tools.list_ports
 
-from PySide6.QtCore import Qt, QTimer
-from PySide6.QtWidgets import (
-    QApplication,
-    QWidget,
-    QLabel,
-    QPushButton,
-    QComboBox,
-    QDoubleSpinBox,
-    QVBoxLayout,
-    QHBoxLayout,
-    QGridLayout,
-    QGroupBox,
-    QMessageBox,
-)
-
-
-# ============================================================
-# CONFIGURATION
-# ============================================================
 
 BAUD_RATE = 115200
+CONTROLLER_ID = "MEGA_GANTRY_M1"
+DEFAULT_SPEED_MM_S = 2.0
+SERIAL_POLL_MS = 20
+PORT_REFRESH_MS = 1500
+KEEPALIVE_MS = 250
+HANDSHAKE_RETRY_MS = 500
 
-DEFAULT_SPEED = 2.0       # mm/s
-DEFAULT_ACCEL = 1.0       # mm/s²
+
+def parse_status_line(line):
+    """Parse and expand one compact Milestone-1 STATUS line."""
+    if not line.startswith("STATUS,"):
+        raise ValueError("not a STATUS line")
+
+    values = {}
+    for item in line.split(",")[1:]:
+        if "=" in item:
+            key, value = item.split("=", 1)
+            values[key.strip()] = value.strip()
+
+    packed_limits = values.get("L")
+    limit_keys = ("XMIN", "XPLUS", "YMIN", "YPLUS", "ZMIN", "ZPLUS")
+    if packed_limits is None or len(packed_limits) != len(limit_keys):
+        raise ValueError("invalid packed limit field")
+    if any(state not in "01" for state in packed_limits):
+        raise ValueError("invalid packed limit state")
+    for key, state in zip(limit_keys, packed_limits):
+        values[key] = state
+
+    packed_motion = values.get("M")
+    if packed_motion is None or len(packed_motion) != 3:
+        raise ValueError("invalid packed motion field")
+    if any(state not in "01" for state in packed_motion):
+        raise ValueError("invalid packed motion state")
+    for axis, state in zip(("X", "Y", "Z"), packed_motion):
+        values["{}MOVING".format(axis)] = state
+
+    for axis in ("X", "Y", "Z"):
+        float(values[axis])
+    return values
 
 
-# ============================================================
-# MAIN WINDOW
-# ============================================================
-
-class XControlUI(QWidget):
+class GantryMotionUI(tk.Tk):
+    AXES = ("X", "Y", "Z")
+    LIMITS = ("XMIN", "XPLUS", "YMIN", "YPLUS", "ZMIN", "ZPLUS")
 
     def __init__(self):
-        super().__init__()
+        tk.Tk.__init__(self)
+        self.title("Gantry Motion Control — Milestone 1")
+        self.geometry("860x690")
+        self.minsize(760, 620)
 
-        self.serial = None
+        self.serial_port = None
+        self.controller_ready = False
+        self.jog_axis = None
+        self.last_handshake_attempt = 0.0
+        self.last_keepalive = 0.0
+        self.last_ports = []
 
-        self.setWindowTitle("X Axis Control")
-        self.resize(700, 560)
+        self.port_var = tk.StringVar()
+        self.connection_var = tk.StringVar(value="● DISCONNECTED")
+        self.status_var = tk.StringVar(value="Ready")
+        self.speed_var = tk.DoubleVar(value=DEFAULT_SPEED_MM_S)
+        self.move_axis_var = tk.StringVar(value="X")
+        self.distance_var = tk.DoubleVar(value=1.0)
+        self.position_vars = {
+            axis: tk.StringVar(value="0.000 mm") for axis in self.AXES
+        }
+        self.limit_vars = {
+            name: tk.StringVar(value="SAFE") for name in self.LIMITS
+        }
+        self.moving_vars = {
+            axis: tk.StringVar(value="IDLE") for axis in self.AXES
+        }
 
+        self.motion_widgets = []
+        self.limit_labels = {}
         self.build_ui()
-
-        # ----------------------------------------------------
-        # Read serial every 20 ms
-        # ----------------------------------------------------
-
-        self.serial_timer = QTimer(self)
-        self.serial_timer.timeout.connect(self.read_serial)
-        self.serial_timer.start(20)
-
-        # ----------------------------------------------------
-        # Refresh serial ports
-        # ----------------------------------------------------
-
-        self.port_timer = QTimer(self)
-        self.port_timer.timeout.connect(self.refresh_ports)
-        self.port_timer.start(1500)
-
+        self.set_motion_enabled(False)
         self.refresh_ports()
 
-
-    # ========================================================
-    # BUILD UI
-    # ========================================================
+        self.bind_all("<ButtonRelease-1>", self.on_global_button_release, add="+")
+        self.protocol("WM_DELETE_WINDOW", self.on_close)
+        self.after(SERIAL_POLL_MS, self.service_serial)
+        self.after(PORT_REFRESH_MS, self.periodic_port_refresh)
 
     def build_ui(self):
+        self.columnconfigure(0, weight=1)
+        self.rowconfigure(1, weight=1)
 
-        main = QVBoxLayout(self)
-
-        main.setSpacing(14)
-
-
-        # ====================================================
-        # TITLE
-        # ====================================================
-
-        title = QLabel("X AXIS CONTROL")
-
-        title.setAlignment(Qt.AlignCenter)
-
-        title.setStyleSheet("""
-            font-size: 26px;
-            font-weight: bold;
-            padding: 10px;
-        """)
-
-        main.addWidget(title)
-
-
-        # ====================================================
-        # SERIAL CONNECTION
-        # ====================================================
-
-        serial_layout = QHBoxLayout()
-
-
-        serial_layout.addWidget(
-            QLabel("Serial:")
+        title = ttk.Label(
+            self,
+            text="XYZ POSITION / MOTION",
+            anchor="center",
+            font=("Segoe UI", 20, "bold"),
         )
+        title.grid(row=0, column=0, sticky="ew", padx=16, pady=(14, 8))
 
+        body = ttk.Frame(self, padding=(16, 8, 16, 16))
+        body.grid(row=1, column=0, sticky="nsew")
+        body.columnconfigure(0, weight=1)
 
-        self.port_box = QComboBox()
+        self.build_connection_panel(body)
+        self.build_position_panel(body)
+        self.build_jog_panel(body)
+        self.build_relative_move_panel(body)
+        self.build_limit_panel(body)
+        self.build_stop_panel(body)
 
-        serial_layout.addWidget(
-            self.port_box,
-            1
+    def build_connection_panel(self, parent):
+        frame = ttk.LabelFrame(parent, text="Arduino Mega connection", padding=10)
+        frame.grid(row=0, column=0, sticky="ew", pady=(0, 8))
+        frame.columnconfigure(1, weight=1)
+
+        ttk.Label(frame, text="Serial port:").grid(row=0, column=0, padx=(0, 8))
+        self.port_box = ttk.Combobox(
+            frame, textvariable=self.port_var, state="readonly", width=42
         )
+        self.port_box.grid(row=0, column=1, sticky="ew")
 
+        self.refresh_button = ttk.Button(frame, text="REFRESH", command=self.refresh_ports)
+        self.refresh_button.grid(row=0, column=2, padx=8)
 
-        self.connect_button = QPushButton(
-            "CONNECT"
+        self.connect_button = ttk.Button(
+            frame, text="CONNECT", command=self.toggle_connection
         )
+        self.connect_button.grid(row=0, column=3)
 
-        self.connect_button.clicked.connect(
-            self.toggle_connection
+        self.connection_label = tk.Label(
+            frame,
+            textvariable=self.connection_var,
+            fg="#b00020",
+            font=("Segoe UI", 10, "bold"),
         )
-
-        serial_layout.addWidget(
-            self.connect_button
-        )
-
-
-        self.connection_label = QLabel(
-            "● DISCONNECTED"
-        )
-
-        self.connection_label.setStyleSheet(
-            "color: red; font-weight: bold;"
-        )
-
-        serial_layout.addWidget(
-            self.connection_label
-        )
-
-
-        main.addLayout(
-            serial_layout
-        )
-
-
-        # ====================================================
-        # POSITION
-        # ====================================================
-
-        position_group = QGroupBox(
-            "Position"
-        )
-
-        position_layout = QVBoxLayout(
-            position_group
-        )
-
-
-        self.position_label = QLabel(
-            "0.000 mm"
-        )
-
-        self.position_label.setAlignment(
-            Qt.AlignCenter
-        )
-
-        self.position_label.setStyleSheet("""
-            font-size: 36px;
-            font-weight: bold;
-            padding: 15px;
-        """)
-
-
-        position_layout.addWidget(
-            self.position_label
-        )
-
-
-        main.addWidget(
-            position_group
-        )
-
-
-        # ====================================================
-        # LIMIT SWITCHES
-        # ====================================================
-
-        limit_group = QGroupBox(
-            "Limit Switches"
-        )
-
-        limit_layout = QHBoxLayout(
-            limit_group
-        )
-
-
-        self.x_minus_indicator = QLabel(
-            "● X− SAFE"
-        )
-
-        self.x_minus_indicator.setAlignment(
-            Qt.AlignCenter
-        )
-
-        self.x_minus_indicator.setStyleSheet("""
-            color: green;
-            font-size: 18px;
-            font-weight: bold;
-            padding: 10px;
-        """)
-
-
-        self.x_plus_indicator = QLabel(
-            "● X+ SAFE"
-        )
-
-        self.x_plus_indicator.setAlignment(
-            Qt.AlignCenter
-        )
-
-        self.x_plus_indicator.setStyleSheet("""
-            color: green;
-            font-size: 18px;
-            font-weight: bold;
-            padding: 10px;
-        """)
-
-
-        limit_layout.addWidget(
-            self.x_minus_indicator
-        )
-
-        limit_layout.addWidget(
-            self.x_plus_indicator
-        )
-
-
-        main.addWidget(
-            limit_group
-        )
-
-
-        # ====================================================
-        # JOG
-        # ====================================================
-
-        jog_group = QGroupBox(
-            "JOG — Hold Button to Move"
-        )
-
-        jog_layout = QHBoxLayout(
-            jog_group
-        )
-
-
-        # ----------------------------------------------------
-        # X- JOG
-        # ----------------------------------------------------
-
-        self.jog_minus_button = QPushButton(
-            "◀  X− JOG"
-        )
-
-        self.jog_minus_button.setMinimumHeight(
-            60
-        )
-
-        self.jog_minus_button.setStyleSheet("""
-            font-size: 18px;
-            font-weight: bold;
-        """)
-
-        # Press = START
-        self.jog_minus_button.pressed.connect(
-            self.start_jog_minus
-        )
-
-        # Release = STOP
-        self.jog_minus_button.released.connect(
-            self.stop_jog
-        )
-
-
-        # ----------------------------------------------------
-        # X+ JOG
-        # ----------------------------------------------------
-
-        self.jog_plus_button = QPushButton(
-            "X+ JOG  ▶"
-        )
-
-        self.jog_plus_button.setMinimumHeight(
-            60
-        )
-
-        self.jog_plus_button.setStyleSheet("""
-            font-size: 18px;
-            font-weight: bold;
-        """)
-
-        # Press = START
-        self.jog_plus_button.pressed.connect(
-            self.start_jog_plus
-        )
-
-        # Release = STOP
-        self.jog_plus_button.released.connect(
-            self.stop_jog
-        )
-
-
-        jog_layout.addWidget(
-            self.jog_minus_button
-        )
-
-        jog_layout.addWidget(
-            self.jog_plus_button
-        )
-
-
-        main.addWidget(
-            jog_group
-        )
-
-
-        # ====================================================
-        # RELATIVE MOVE
-        # ====================================================
-
-        move_group = QGroupBox(
-            "Relative Move"
-        )
-
-        move_layout = QGridLayout(
-            move_group
-        )
-
-
-        self.move_minus_10 = QPushButton(
-            "−10 mm"
-        )
-
-        self.move_minus_1 = QPushButton(
-            "−1 mm"
-        )
-
-        self.move_plus_1 = QPushButton(
-            "+1 mm"
-        )
-
-        self.move_plus_10 = QPushButton(
-            "+10 mm"
-        )
-
-
-        move_buttons = [
-            self.move_minus_10,
-            self.move_minus_1,
-            self.move_plus_1,
-            self.move_plus_10,
-        ]
-
-
-        for button in move_buttons:
-
-            button.setMinimumHeight(
-                50
+        self.connection_label.grid(row=0, column=4, padx=(12, 0))
+
+    def build_position_panel(self, parent):
+        frame = ttk.LabelFrame(parent, text="Session position", padding=10)
+        frame.grid(row=1, column=0, sticky="ew", pady=8)
+        for column in range(3):
+            frame.columnconfigure(column, weight=1)
+
+        for column, axis in enumerate(self.AXES):
+            ttk.Label(
+                frame, text=axis, anchor="center", font=("Segoe UI", 14, "bold")
+            ).grid(row=0, column=column, sticky="ew")
+            ttk.Label(
+                frame,
+                textvariable=self.position_vars[axis],
+                anchor="center",
+                font=("Consolas", 24, "bold"),
+            ).grid(row=1, column=column, sticky="ew", pady=(2, 0))
+            ttk.Label(
+                frame, textvariable=self.moving_vars[axis], anchor="center"
+            ).grid(row=2, column=column, sticky="ew")
+
+    def build_jog_panel(self, parent):
+        frame = ttk.LabelFrame(parent, text="Jog — hold to move", padding=10)
+        frame.grid(row=2, column=0, sticky="ew", pady=8)
+        for column in range(3):
+            frame.columnconfigure(column, weight=1)
+
+        for column, axis in enumerate(self.AXES):
+            axis_frame = ttk.Frame(frame)
+            axis_frame.grid(row=0, column=column, sticky="ew", padx=6)
+            axis_frame.columnconfigure(0, weight=1)
+            axis_frame.columnconfigure(1, weight=1)
+            ttk.Label(axis_frame, text=axis, anchor="center").grid(
+                row=0, column=0, columnspan=2, sticky="ew", pady=(0, 4)
             )
 
-            button.setStyleSheet(
-                "font-size: 16px;"
+            minus = ttk.Button(axis_frame, text="{}−".format(axis))
+            plus = ttk.Button(axis_frame, text="{}+".format(axis))
+            minus.grid(row=1, column=0, sticky="ew", padx=(0, 3))
+            plus.grid(row=1, column=1, sticky="ew", padx=(3, 0))
+            minus.bind(
+                "<ButtonPress-1>",
+                lambda event, selected_axis=axis: self.start_jog(selected_axis, -1),
             )
+            minus.bind("<ButtonRelease-1>", self.stop_jog)
+            plus.bind(
+                "<ButtonPress-1>",
+                lambda event, selected_axis=axis: self.start_jog(selected_axis, 1),
+            )
+            plus.bind("<ButtonRelease-1>", self.stop_jog)
+            self.motion_widgets.extend((minus, plus))
 
+    def build_relative_move_panel(self, parent):
+        frame = ttk.LabelFrame(parent, text="Relative move", padding=10)
+        frame.grid(row=3, column=0, sticky="ew", pady=8)
+        frame.columnconfigure(3, weight=1)
 
-        self.move_minus_10.clicked.connect(
-            lambda: self.move_relative(-10.0)
+        ttk.Label(frame, text="Axis:").grid(row=0, column=0, padx=(0, 6))
+        axis_box = ttk.Combobox(
+            frame,
+            textvariable=self.move_axis_var,
+            values=self.AXES,
+            state="readonly",
+            width=5,
         )
+        axis_box.grid(row=0, column=1, padx=(0, 16))
 
-        self.move_minus_1.clicked.connect(
-            lambda: self.move_relative(-1.0)
+        ttk.Label(frame, text="Distance:").grid(row=0, column=2, padx=(0, 6))
+        distance_box = ttk.Spinbox(
+            frame,
+            from_=-1000.0,
+            to=1000.0,
+            increment=0.1,
+            textvariable=self.distance_var,
+            width=12,
         )
+        distance_box.grid(row=0, column=3, sticky="w")
+        ttk.Label(frame, text="mm").grid(row=0, column=4, padx=(4, 16))
 
-        self.move_plus_1.clicked.connect(
-            lambda: self.move_relative(1.0)
+        move_button = ttk.Button(frame, text="MOVE", command=self.move_relative)
+        move_button.grid(row=0, column=5, padx=(0, 8))
+
+        ttk.Label(frame, text="Speed:").grid(row=0, column=6, padx=(8, 6))
+        speed_box = ttk.Spinbox(
+            frame,
+            from_=0.05,
+            to=20.0,
+            increment=0.05,
+            textvariable=self.speed_var,
+            width=9,
+            command=self.apply_speed,
         )
+        speed_box.grid(row=0, column=7)
+        speed_box.bind("<Return>", lambda event: self.apply_speed())
+        speed_box.bind("<FocusOut>", lambda event: self.apply_speed())
+        ttk.Label(frame, text="mm/s").grid(row=0, column=8, padx=(4, 0))
 
-        self.move_plus_10.clicked.connect(
-            lambda: self.move_relative(10.0)
+        self.motion_widgets.extend((axis_box, distance_box, move_button, speed_box))
+
+    def build_limit_panel(self, parent):
+        frame = ttk.LabelFrame(parent, text="Limit switches", padding=10)
+        frame.grid(row=4, column=0, sticky="ew", pady=8)
+        for column in range(6):
+            frame.columnconfigure(column, weight=1)
+
+        labels = (
+            ("XMIN", "X−"),
+            ("XPLUS", "X+"),
+            ("YMIN", "Y−"),
+            ("YPLUS", "Y+"),
+            ("ZMIN", "Z−"),
+            ("ZPLUS", "Z+"),
         )
+        for column, (key, display_name) in enumerate(labels):
+            label = tk.Label(
+                frame,
+                text="{} SAFE".format(display_name),
+                fg="#187a2f",
+                font=("Segoe UI", 10, "bold"),
+                padx=5,
+                pady=8,
+            )
+            label.grid(row=0, column=column, sticky="ew")
+            self.limit_labels[key] = (label, display_name)
 
+    def build_stop_panel(self, parent):
+        frame = ttk.Frame(parent)
+        frame.grid(row=5, column=0, sticky="ew", pady=(10, 0))
+        frame.columnconfigure(0, weight=1)
 
-        move_layout.addWidget(
-            self.move_minus_10,
-            0,
-            0
+        self.stop_button = tk.Button(
+            frame,
+            text="STOP",
+            command=self.emergency_stop,
+            bg="#b00020",
+            fg="white",
+            activebackground="#8b0018",
+            activeforeground="white",
+            font=("Segoe UI", 18, "bold"),
+            height=2,
+            state=tk.DISABLED,
         )
+        self.stop_button.grid(row=0, column=0, sticky="ew")
 
-        move_layout.addWidget(
-            self.move_minus_1,
-            0,
-            1
+        ttk.Label(frame, textvariable=self.status_var, anchor="w").grid(
+            row=1, column=0, sticky="ew", pady=(8, 0)
         )
-
-        move_layout.addWidget(
-            self.move_plus_1,
-            0,
-            2
-        )
-
-        move_layout.addWidget(
-            self.move_plus_10,
-            0,
-            3
-        )
-
-
-        main.addWidget(
-            move_group
-        )
-
-
-        # ====================================================
-        # SPEED / ACCELERATION
-        # ====================================================
-
-        settings_group = QGroupBox(
-            "Motion Settings"
-        )
-
-        settings_layout = QGridLayout(
-            settings_group
-        )
-
-
-        # ----------------------------------------------------
-        # SPEED
-        # ----------------------------------------------------
-
-        settings_layout.addWidget(
-            QLabel("Speed:"),
-            0,
-            0
-        )
-
-
-        self.speed_box = QDoubleSpinBox()
-
-        self.speed_box.setRange(
-            0.1,
-            20.0
-        )
-
-        self.speed_box.setDecimals(
-            1
-        )
-
-        self.speed_box.setSingleStep(
-            0.1
-        )
-
-        self.speed_box.setValue(
-            DEFAULT_SPEED
-        )
-
-        self.speed_box.setSuffix(
-            " mm/s"
-        )
-
-
-        settings_layout.addWidget(
-            self.speed_box,
-            0,
-            1
-        )
-
-
-        # ----------------------------------------------------
-        # ACCELERATION
-        # ----------------------------------------------------
-
-        settings_layout.addWidget(
-            QLabel("Acceleration:"),
-            0,
-            2
-        )
-
-
-        self.accel_box = QDoubleSpinBox()
-
-        self.accel_box.setRange(
-            0.1,
-            50.0
-        )
-
-        self.accel_box.setDecimals(
-            1
-        )
-
-        self.accel_box.setSingleStep(
-            0.1
-        )
-
-        self.accel_box.setValue(
-            DEFAULT_ACCEL
-        )
-
-        self.accel_box.setSuffix(
-            " mm/s²"
-        )
-
-
-        settings_layout.addWidget(
-            self.accel_box,
-            0,
-            3
-        )
-
-
-        # IMPORTANT:
-        #
-        # Changing the UI value immediately sends the new
-        # setting to Arduino.
-
-        self.speed_box.valueChanged.connect(
-            self.speed_changed
-        )
-
-        self.accel_box.valueChanged.connect(
-            self.accel_changed
-        )
-
-
-        main.addWidget(
-            settings_group
-        )
-
-
-        # ====================================================
-        # HOME / STOP
-        # ====================================================
-
-        control_layout = QHBoxLayout()
-
-
-        self.home_button = QPushButton(
-            "HOME X"
-        )
-
-        self.home_button.setMinimumHeight(
-            60
-        )
-
-        self.home_button.setStyleSheet("""
-            font-size: 18px;
-            font-weight: bold;
-        """)
-
-        self.home_button.clicked.connect(
-            self.home_x
-        )
-
-
-        self.stop_button = QPushButton(
-            "STOP"
-        )
-
-        self.stop_button.setMinimumHeight(
-            60
-        )
-
-        self.stop_button.setStyleSheet("""
-            background-color: #b00020;
-            color: white;
-            font-size: 20px;
-            font-weight: bold;
-        """)
-
-        self.stop_button.clicked.connect(
-            self.emergency_stop
-        )
-
-
-        control_layout.addWidget(
-            self.home_button
-        )
-
-        control_layout.addWidget(
-            self.stop_button
-        )
-
-
-        main.addLayout(
-            control_layout
-        )
-
-
-        # ====================================================
-        # SERIAL STATUS
-        # ====================================================
-
-        self.status_label = QLabel(
-            "Ready"
-        )
-
-        self.status_label.setStyleSheet("""
-            color: #555;
-            padding: 6px;
-        """)
-
-        main.addWidget(
-            self.status_label
-        )
-
-
-    # ========================================================
-    # SERIAL PORTS
-    # ========================================================
 
     def refresh_ports(self):
-
-        # Don't refresh while connected
-        if (
-            self.serial is not None
-            and
-            self.serial.is_open
-        ):
+        if self.is_serial_open():
             return
-
-
-        current_port = (
-            self.port_box.currentText()
-        )
-
-
-        ports = [
-            port.device
-            for port
-            in serial.tools.list_ports.comports()
-        ]
-
-
-        current_list = [
-            self.port_box.itemText(i)
-            for i
-            in range(
-                self.port_box.count()
-            )
-        ]
-
-
-        if ports == current_list:
+        ports = list(serial.tools.list_ports.comports())
+        devices = [port.device for port in ports]
+        labels = ["{} — {}".format(port.device, port.description) for port in ports]
+        if devices == self.last_ports:
             return
+        selected = self.port_var.get().split(" — ", 1)[0]
+        self.last_ports = devices
+        self.port_box["values"] = labels
+        if selected in devices:
+            self.port_box.current(devices.index(selected))
+        elif labels:
+            self.port_box.current(0)
+        else:
+            self.port_var.set("")
 
-
-        self.port_box.clear()
-
-        self.port_box.addItems(
-            ports
-        )
-
-
-        if current_port in ports:
-
-            self.port_box.setCurrentText(
-                current_port
-            )
-
-
-    # ========================================================
-    # CONNECT / DISCONNECT
-    # ========================================================
+    def periodic_port_refresh(self):
+        self.refresh_ports()
+        self.after(PORT_REFRESH_MS, self.periodic_port_refresh)
 
     def toggle_connection(self):
+        if self.is_serial_open():
+            self.disconnect_serial("Disconnected")
+        else:
+            self.connect_serial()
 
-        # ====================================================
-        # DISCONNECT
-        # ====================================================
-
-        if (
-            self.serial is not None
-            and
-            self.serial.is_open
-        ):
-
-            try:
-
-                self.send_command(
-                    "STOP"
-                )
-
-                self.serial.close()
-
-            except Exception:
-                pass
-
-
-            self.serial = None
-
-
-            self.connect_button.setText(
-                "CONNECT"
-            )
-
-
-            self.connection_label.setText(
-                "● DISCONNECTED"
-            )
-
-            self.connection_label.setStyleSheet(
-                "color: red; font-weight: bold;"
-            )
-
-
-            self.status_label.setText(
-                "Disconnected"
-            )
-
-
-            return
-
-
-        # ====================================================
-        # CONNECT
-        # ====================================================
-
-        port = (
-            self.port_box.currentText()
-        )
-
-
+    def connect_serial(self):
+        port = self.port_var.get().split(" — ", 1)[0]
         if not port:
-
-            QMessageBox.warning(
-                self,
-                "Serial",
-                "No serial port selected."
-            )
-
+            messagebox.warning("Serial", "No serial port selected.")
             return
-
-
         try:
-
-            self.serial = serial.Serial(
+            self.serial_port = serial.Serial(
                 port=port,
                 baudrate=BAUD_RATE,
-                timeout=0
+                timeout=0,
+                write_timeout=0.5,
             )
-
-
-            self.connect_button.setText(
-                "DISCONNECT"
-            )
-
-
-            self.connection_label.setText(
-                "● CONNECTED"
-            )
-
-            self.connection_label.setStyleSheet(
-                "color: green; font-weight: bold;"
-            )
-
-
-            self.status_label.setText(
-                "Connected. Waiting for Arduino..."
-            )
-
-
-            # Arduino Mega often resets when the serial
-            # connection opens.
-            #
-            # Wait 1.5 seconds before sending settings.
-
-            QTimer.singleShot(
-                1500,
-                self.initialize_arduino
-            )
-
-
-        except Exception as error:
-
-            self.serial = None
-
-
-            QMessageBox.critical(
-                self,
-                "Serial Error",
-                str(error)
-            )
-
-
-    # ========================================================
-    # INITIALIZE ARDUINO
-    # ========================================================
-
-    def initialize_arduino(self):
-
-        if not self.is_connected():
+            self.serial_port.reset_input_buffer()
+        except (OSError, serial.SerialException) as error:
+            self.serial_port = None
+            messagebox.showerror("Serial error", str(error))
             return
 
-
-        # ----------------------------------------------------
-        # Send the CURRENT UI settings.
-        #
-        # Defaults:
-        #
-        # 2.0 mm/s
-        # 1.0 mm/s²
-        #
-        # ----------------------------------------------------
-
-        self.send_command(
-            f"SPEED {self.speed_box.value():.3f}"
-        )
-
-
-        self.send_command(
-            f"ACCEL {self.accel_box.value():.3f}"
-        )
-
-
-        self.status_label.setText(
-            "Controller initialized"
-        )
-
-
-    # ========================================================
-    # CONNECTION CHECK
-    # ========================================================
-
-    def is_connected(self):
-
-        return (
-            self.serial is not None
-            and
-            self.serial.is_open
-        )
-
-
-    # ========================================================
-    # SEND COMMAND
-    # ========================================================
-
-    def send_command(
-        self,
-        command
-    ):
-
-        if not self.is_connected():
-
-            self.status_label.setText(
-                "Not connected"
-            )
-
-            return False
-
-
-        try:
-
-            message = (
-                command + "\n"
-            ).encode(
-                "utf-8"
-            )
-
-
-            self.serial.write(
-                message
-            )
-
-
-            self.serial.flush()
-
-
-            self.status_label.setText(
-                "TX: " + command
-            )
-
-
-            return True
-
-
-        except Exception as error:
-
-            self.status_label.setText(
-                "TX ERROR: "
-                + str(error)
-            )
-
-
-            return False
-
-
-    # ========================================================
-    # SPEED
-    # ========================================================
-
-    def speed_changed(
-        self,
-        value
-    ):
-
-        if not self.is_connected():
-            return
-
-
-        self.send_command(
-            f"SPEED {value:.3f}"
-        )
-
-
-    # ========================================================
-    # ACCELERATION
-    # ========================================================
-
-    def accel_changed(
-        self,
-        value
-    ):
-
-        if not self.is_connected():
-            return
-
-
-        self.send_command(
-            f"ACCEL {value:.3f}"
-        )
-
-
-    # ========================================================
-    # JOG X-
-    # ========================================================
-
-    def start_jog_minus(self):
-
-        # EXACT Arduino command:
-        #
-        # JOG X-
-
-        self.send_command(
-            "JOG X-"
-        )
-
-
-    # ========================================================
-    # JOG X+
-    # ========================================================
-
-    def start_jog_plus(self):
-
-        # EXACT Arduino command:
-        #
-        # JOG X+
-
-        self.send_command(
-            "JOG X+"
-        )
-
-
-    # ========================================================
-    # STOP JOG
-    # ========================================================
-
-    def stop_jog(self):
-
-        self.send_command(
-            "JOG STOP"
-        )
-
-
-    # ========================================================
-    # RELATIVE MOVE
-    # ========================================================
-
-    def move_relative(
-        self,
-        distance
-    ):
-
-        self.send_command(
-            f"MOVE {distance:.3f}"
-        )
-
-
-    # ========================================================
-    # HOME
-    # ========================================================
-
-    def home_x(self):
-
-        self.send_command(
-            "HOME"
-        )
-
-
-    # ========================================================
-    # STOP
-    # ========================================================
-
-    def emergency_stop(self):
-
-        self.send_command(
-            "STOP"
-        )
-
-
-    # ========================================================
-    # READ SERIAL
-    # ========================================================
-
-    def read_serial(self):
-
-        if not self.is_connected():
-            return
-
-
-        try:
-
-            while (
-                self.serial.in_waiting > 0
-            ):
-
-                line = (
-                    self.serial.readline()
-                    .decode(
-                        "utf-8",
-                        errors="ignore"
-                    )
-                    .strip()
-                )
-
-
-                if not line:
-                    continue
-
-
-                # --------------------------------------------
-                # STATUS
-                # --------------------------------------------
-
-                if line.startswith(
-                    "STATUS,"
-                ):
-
-                    self.parse_status(
-                        line
-                    )
-
-
-                # --------------------------------------------
-                # OTHER MESSAGE
-                # --------------------------------------------
-
-                else:
-
-                    self.status_label.setText(
-                        "RX: " + line
-                    )
-
-
-        except Exception as error:
-
-            self.status_label.setText(
-                "RX ERROR: "
-                + str(error)
-            )
-
-
-    # ========================================================
-    # PARSE STATUS
-    #
-    # Arduino sends:
-    #
-    # STATUS,X=10.000,XMIN=0,XPLUS=0,HOME=0,MOVING=0
-    #
-    # ========================================================
-
-    def parse_status(
-        self,
-        line
-    ):
-
-        try:
-
-            values = {}
-
-
-            parts = line.split(",")
-
-
-            for part in parts[1:]:
-
-                if "=" not in part:
-                    continue
-
-
-                key, value = (
-                    part.split(
-                        "=",
-                        1
-                    )
-                )
-
-
-                values[
-                    key.strip()
-                ] = value.strip()
-
-
-            # =================================================
-            # POSITION
-            # =================================================
-
-            if "X" in values:
-
-                position = float(
-                    values["X"]
-                )
-
-
-                # Avoid -0.000
-
-                if abs(position) < 0.0005:
-
-                    position = 0.0
-
-
-                self.position_label.setText(
-                    f"{position:.3f} mm"
-                )
-
-
-            # =================================================
-            # X-
-            # =================================================
-
-            x_minus_triggered = (
-                values.get(
-                    "XMIN",
-                    "0"
-                )
-                ==
-                "1"
-            )
-
-
-            self.update_limit_indicator(
-                self.x_minus_indicator,
-                "X−",
-                x_minus_triggered
-            )
-
-
-            # =================================================
-            # X+
-            # =================================================
-
-            x_plus_triggered = (
-                values.get(
-                    "XPLUS",
-                    "0"
-                )
-                ==
-                "1"
-            )
-
-
-            self.update_limit_indicator(
-                self.x_plus_indicator,
-                "X+",
-                x_plus_triggered
-            )
-
-
-        except Exception as error:
-
-            self.status_label.setText(
-                "STATUS ERROR: "
-                + str(error)
-            )
-
-
-    # ========================================================
-    # LIMIT INDICATOR
-    # ========================================================
-
-    def update_limit_indicator(
-        self,
-        label,
-        name,
-        triggered
-    ):
-
-        if triggered:
-
-            label.setText(
-                f"● {name} TRIGGERED"
-            )
-
-
-            label.setStyleSheet("""
-                color: red;
-                font-size: 18px;
-                font-weight: bold;
-                padding: 10px;
-            """)
-
-
-        else:
-
-            label.setText(
-                f"● {name} SAFE"
-            )
-
-
-            label.setStyleSheet("""
-                color: green;
-                font-size: 18px;
-                font-weight: bold;
-                padding: 10px;
-            """)
-
-
-    # ========================================================
-    # WINDOW CLOSE
-    # ========================================================
-
-    def closeEvent(
-        self,
-        event
-    ):
-
-        # Stop X before program exits
-
-        if self.is_connected():
-
+        self.controller_ready = False
+        self.jog_axis = None
+        self.last_handshake_attempt = 0.0
+        self.connect_button.configure(text="DISCONNECT")
+        self.port_box.configure(state="disabled")
+        self.refresh_button.configure(state="disabled")
+        self.stop_button.configure(state=tk.NORMAL)
+        self.connection_var.set("● CONNECTING")
+        self.connection_label.configure(fg="#9a6700")
+        self.status_var.set("Waiting for {}...".format(CONTROLLER_ID))
+
+    def disconnect_serial(self, reason):
+        if self.is_serial_open():
             try:
-
-                self.serial.write(
-                    b"STOP\n"
-                )
-
-                self.serial.flush()
-
-                self.serial.close()
-
+                self.send_command("STOP", require_ready=False)
             except Exception:
                 pass
+            try:
+                self.serial_port.close()
+            except (OSError, serial.SerialException):
+                pass
+        self.serial_port = None
+        self.controller_ready = False
+        self.jog_axis = None
+        self.set_motion_enabled(False)
+        self.stop_button.configure(state=tk.DISABLED)
+        self.connect_button.configure(text="CONNECT")
+        self.port_box.configure(state="readonly")
+        self.refresh_button.configure(state="normal")
+        self.connection_var.set("● DISCONNECTED")
+        self.connection_label.configure(fg="#b00020")
+        self.status_var.set(reason)
+        for axis in self.AXES:
+            self.moving_vars[axis].set("IDLE")
+
+    def is_serial_open(self):
+        return self.serial_port is not None and self.serial_port.is_open
+
+    def set_motion_enabled(self, enabled):
+        state = "normal" if enabled else "disabled"
+        for widget in self.motion_widgets:
+            if isinstance(widget, ttk.Combobox):
+                widget.configure(state="readonly" if enabled else "disabled")
+            else:
+                widget.configure(state=state)
+
+    def send_command(self, command, require_ready=True):
+        if not self.is_serial_open():
+            return False
+        if require_ready and not self.controller_ready:
+            self.status_var.set("Controller handshake is not complete")
+            return False
+        try:
+            self.serial_port.write((command.strip() + "\n").encode("ascii"))
+            self.serial_port.flush()
+            return True
+        except (OSError, serial.SerialException) as error:
+            self.disconnect_serial("Serial write failed: {}".format(error))
+            return False
+
+    def service_serial(self):
+        if self.is_serial_open():
+            try:
+                while self.serial_port.in_waiting:
+                    line = self.serial_port.readline().decode(
+                        "ascii", errors="replace"
+                    ).strip()
+                    if line:
+                        self.handle_serial_line(line)
+            except (OSError, serial.SerialException) as error:
+                self.disconnect_serial("Serial read failed: {}".format(error))
+
+        now = time.monotonic()
+        if self.is_serial_open() and not self.controller_ready:
+            if (now - self.last_handshake_attempt) * 1000.0 >= HANDSHAKE_RETRY_MS:
+                self.last_handshake_attempt = now
+                self.send_command("HELLO", require_ready=False)
+        elif self.controller_ready:
+            if (now - self.last_keepalive) * 1000.0 >= KEEPALIVE_MS:
+                self.last_keepalive = now
+                self.send_command("KEEPALIVE")
+
+        self.after(SERIAL_POLL_MS, self.service_serial)
+
+    def handle_serial_line(self, line):
+        if line == "READY,{}".format(CONTROLLER_ID) or line == "IDENTITY,{}".format(
+            CONTROLLER_ID
+        ):
+            if not self.controller_ready:
+                self.controller_ready = True
+                self.connection_var.set("● CONNECTED")
+                self.connection_label.configure(fg="#187a2f")
+                self.set_motion_enabled(True)
+                self.apply_speed()
+                self.send_command("STATUS")
+                self.status_var.set("Controller ready")
+            return
+
+        if line.startswith("STATUS,"):
+            self.parse_status(line)
+            return
+
+        if line.startswith("EVENT,") or line.startswith("ERROR,"):
+            self.status_var.set(line)
+            if "STOP" in line or "LIMIT" in line or "WATCHDOG" in line:
+                self.jog_axis = None
+            return
+
+        if line.startswith("OK,"):
+            self.status_var.set(line)
+
+    def parse_status(self, line):
+        try:
+            values = parse_status_line(line)
+
+            for axis in self.AXES:
+                if axis in values:
+                    position = float(values[axis])
+                    if abs(position) < 0.0005:
+                        position = 0.0
+                    self.position_vars[axis].set("{:.3f} mm".format(position))
+                moving_key = "{}MOVING".format(axis)
+                self.moving_vars[axis].set(
+                    "MOVING" if values.get(moving_key, "0") == "1" else "IDLE"
+                )
+
+            for key in self.LIMITS:
+                self.update_limit(key, values.get(key, "0") == "1")
+        except (KeyError, ValueError):
+            self.status_var.set("Invalid STATUS: {}".format(line))
+
+    def update_limit(self, key, triggered):
+        label, display_name = self.limit_labels[key]
+        if triggered:
+            label.configure(text="{} TRIGGERED".format(display_name), fg="#b00020")
+        else:
+            label.configure(text="{} SAFE".format(display_name), fg="#187a2f")
+
+    def validated_speed(self):
+        try:
+            speed = float(self.speed_var.get())
+        except (tk.TclError, ValueError):
+            self.status_var.set("Speed must be a number")
+            return None
+        if not 0.05 <= speed <= 20.0:
+            self.status_var.set("Speed must be between 0.05 and 20.0 mm/s")
+            return None
+        return speed
+
+    def apply_speed(self):
+        speed = self.validated_speed()
+        if speed is not None:
+            self.send_command("SPEED {:.3f}".format(speed))
+
+    def start_jog(self, axis, direction):
+        speed = self.validated_speed()
+        if speed is None:
+            return
+        self.send_command("SPEED {:.3f}".format(speed))
+        sign = "+" if direction > 0 else "-"
+        if self.send_command("JOG {} {}".format(axis, sign)):
+            self.jog_axis = axis
+
+    def stop_jog(self, event=None):
+        if self.jog_axis is not None:
+            self.send_command("STOP")
+            self.jog_axis = None
+
+    def on_global_button_release(self, event):
+        self.stop_jog(event)
+
+    def move_relative(self):
+        speed = self.validated_speed()
+        if speed is None:
+            return
+        try:
+            distance = float(self.distance_var.get())
+        except (tk.TclError, ValueError):
+            self.status_var.set("Distance must be a number")
+            return
+        if distance == 0.0 or abs(distance) > 1000.0:
+            self.status_var.set("Distance must be non-zero and within ±1000 mm")
+            return
+        axis = self.move_axis_var.get()
+        if axis not in self.AXES:
+            return
+        self.send_command("SPEED {:.3f}".format(speed))
+        self.send_command("MOVE {} {:.3f}".format(axis, distance))
+
+    def emergency_stop(self):
+        self.send_command("STOP", require_ready=False)
+        self.jog_axis = None
+        self.status_var.set("STOP sent")
+
+    def on_close(self):
+        if self.is_serial_open():
+            try:
+                self.serial_port.write(b"STOP\n")
+                self.serial_port.flush()
+            except (OSError, serial.SerialException):
+                pass
+            try:
+                self.serial_port.close()
+            except (OSError, serial.SerialException):
+                pass
+        self.destroy()
 
 
-        event.accept()
+def main():
+    app = GantryMotionUI()
+    app.mainloop()
 
-
-# ============================================================
-# PROGRAM START
-# ============================================================
 
 if __name__ == "__main__":
-
-    app = QApplication(
-        sys.argv
-    )
-
-
-    window = XControlUI()
-
-    window.show()
-
-
-    sys.exit(
-        app.exec()
-    )
+    try:
+        main()
+    except KeyboardInterrupt:
+        sys.exit(0)
