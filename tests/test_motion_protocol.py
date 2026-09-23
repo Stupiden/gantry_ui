@@ -30,7 +30,7 @@ class MotionProtocolTests(unittest.TestCase):
         values = parse_status_line(
             "STATUS,X=1.250,Y=-2.000,Z=0.006,SX=0.250,SY=-3.000,SZ=0.000,"
             "L=010101,M=101,H=110,A=01,P=10,PI=2.00,PO=3.50,"
-            "LC=1,T=0,R=1234,FR=1200,F=99.50"
+            "LC=1,T=0,R=1234,FR=1200,F=99.50,PR=1,PD=0.125"
         )
         self.assertEqual(values["X"], "1.250")
         self.assertEqual(values["YMIN"], "0")
@@ -49,6 +49,8 @@ class MotionProtocolTests(unittest.TestCase):
         self.assertEqual(values["R"], "1234")
         self.assertEqual(values["FR"], "1200")
         self.assertEqual(values["F"], "99.50")
+        self.assertEqual(values["PR"], "1")
+        self.assertEqual(values["PD"], "0.125")
 
     def test_bad_status_is_rejected(self):
         bad_lines = (
@@ -71,15 +73,15 @@ class MotionProtocolTests(unittest.TestCase):
         self.assertEqual(lines, [])
         lines, buffer = extract_complete_lines(
             buffer,
-            b"GANTRY_M5\r\nSTATUS,X=0,Y=0,Z=0,SX=0,SY=0,SZ=0,"
+            b"GANTRY_M6\r\nSTATUS,X=0,Y=0,Z=0,SX=0,SY=0,SZ=0,"
             b"L=000000,M=000,H=000,A=00,P=00,PI=2,PO=2,"
-            b"LC=1,T=0,R=0,FR=0,F=0\n",
+            b"LC=1,T=0,R=0,FR=0,F=0,PR=0,PD=0\n",
         )
         self.assertEqual(
             lines,
             [
-                "IDENTITY,MEGA_GANTRY_M5",
-                "STATUS,X=0,Y=0,Z=0,SX=0,SY=0,SZ=0,L=000000,M=000,H=000,A=00,P=00,PI=2,PO=2,LC=1,T=0,R=0,FR=0,F=0",
+                "IDENTITY,MEGA_GANTRY_M6",
+                "STATUS,X=0,Y=0,Z=0,SX=0,SY=0,SZ=0,L=000000,M=000,H=000,A=00,P=00,PI=2,PO=2,LC=1,T=0,R=0,FR=0,F=0,PR=0,PD=0",
             ],
         )
         self.assertEqual(buffer, b"")
@@ -164,6 +166,24 @@ class MotionProtocolTests(unittest.TestCase):
         self.assertIn('strcmp(verb, "TARE")', firmware)
         self.assertIn('self.send_command("TARE")', ui)
         self.assertNotIn("PRESS_DOWN", firmware)
+
+    def test_milestone_six_force_limited_press_and_measured_lift(self):
+        firmware = (
+            ROOT / "mega_x_controller" / "mega_x_controller.ino"
+        ).read_text(encoding="utf-8")
+        ui = (ROOT / "x_control.py").read_text(encoding="utf-8")
+        self.assertIn("MODE_PRESS", firmware)
+        self.assertIn("MODE_LIFT", firmware)
+        self.assertIn("loadCellForceGrams >= pressForceThresholdG", firmware)
+        self.assertIn("capturePressLiftDistance()", firmware)
+        self.assertIn("long depth = pressStartSteps - zAxis.positionSteps", firmware)
+        self.assertIn("zAxis.direction = -1", firmware)
+        self.assertIn("zAxis.direction = 1", firmware)
+        self.assertIn("DEFAULT_PRESS_TRAVEL_MM = 20.0f", firmware)
+        self.assertIn('strcmp(verb, "PRESS")', firmware)
+        self.assertIn('strcmp(verb, "LIFT")', firmware)
+        self.assertIn('self.send_command("MOTION_STOP")', ui)
+        self.assertIn('self.send_command("LIFT")', ui)
 
     def test_python_sources_parse_on_python_37_grammar(self):
         for relative_path in ("x_control.py", "tests/test_motion_protocol.py"):

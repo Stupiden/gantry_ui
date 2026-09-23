@@ -1,11 +1,11 @@
 /*
-  Milestone 5: Arduino Mega motion, pumps, and S-type load-cell reading.
+  Milestone 6: Arduino Mega force-limited Z press and lift.
 
   Scope: position reporting, jog, relative move, immediate software STOP,
   six limit inputs, dual-Y synchronized STEP pulses, homing to MINUS limits,
   independent machine/scan coordinates, dual-Y driver alarm interlock,
   two fixed-direction peristaltic pumps, non-blocking ADS1220 force reading,
-  and a serial watchdog. Press-down automation is intentionally not included.
+  force-limited Z press/lift, and a serial watchdog.
 */
 
 #include <Arduino.h>
@@ -13,7 +13,7 @@
 #include <stdlib.h>
 #include <string.h>
 
-const char CONTROLLER_ID[] = "MEGA_GANTRY_M5";
+const char CONTROLLER_ID[] = "MEGA_GANTRY_M6";
 
 const uint8_t X_STEP = 2;
 const uint8_t X_DIR = 3;
@@ -63,6 +63,13 @@ const float LOAD_CELL_CAL_SLOPE = 0.1165f;
 const float LOAD_CELL_CAL_INTERCEPT = -0.6286f;
 const uint8_t LOAD_CELL_FILTER_SAMPLES = 10;
 const uint8_t LOAD_CELL_TARE_SAMPLES = 30;
+const float DEFAULT_PRESS_SPEED_MM_S = 0.25f;
+const float MIN_PRESS_SPEED_MM_S = 0.05f;
+const float MAX_PRESS_SPEED_MM_S = 0.50f;
+const float DEFAULT_PRESS_FORCE_G = 100.0f;
+const float MAX_PRESS_FORCE_G = 5000.0f;
+const float DEFAULT_PRESS_TRAVEL_MM = 20.0f;
+const float MAX_PRESS_TRAVEL_MM = 50.0f;
 const unsigned long STATUS_INTERVAL_MS = 100;
 const unsigned long COMMAND_WATCHDOG_MS = 750;
 const size_t COMMAND_BUFFER_SIZE = 96;
@@ -71,7 +78,9 @@ enum MotionMode {
   MODE_IDLE,
   MODE_JOG,
   MODE_MOVE,
-  MODE_HOME
+  MODE_HOME,
+  MODE_PRESS,
+  MODE_LIFT
 };
 
 struct AxisState {
@@ -124,6 +133,12 @@ bool loadCellHasReading = false;
 bool loadCellTareActive = true;
 bool loadCellTared = false;
 float loadCellForceGrams = 0.0f;
+long pressStartSteps = 0;
+unsigned long pressLiftSteps = 0;
+float pressForceThresholdG = DEFAULT_PRESS_FORCE_G;
+float pressSpeedMM = DEFAULT_PRESS_SPEED_MM_S;
+bool pressCanLift = false;
+volatile MotionMode completedMotionMode = MODE_IDLE;
 
 uint16_t timerPeriodForSpeed(float speedMMPerSecond);
 uint16_t pumpTimerPeriod(float rpm);
@@ -316,6 +331,67 @@ void stopAll() {
   setStepLevel(zAxis, LOW);
 }
 
+void capturePressLiftDistance() {
+  long depth = pressStartSteps - zAxis.positionSteps;
+  pressLiftSteps = depth > 0 ? static_cast<unsigned long>(depth) : 0;
+  pressCanLift = pressLiftSteps > 0;
+}
+
+bool startPress(float forceThresholdG, float maxTravelMM,
+                float pressSpeedRequested) {
+  if (!loadCellHasReading || !loadCellTared || loadCellTareActive) {
+    Serial.println(F("ERROR,LOAD_CELL_NOT_READY"));
+    return false;
+  }
+  if (loadCellForceGrams >= forceThresholdG) {
+    Serial.println(F("ERROR,FORCE_ALREADY_AT_THRESHOLD"));
+    return false;
+  }
+  if (!movementAllowed(zAxis, -1)) {
+    Serial.println(F("ERROR,LIMIT_BLOCKED,Z,ZMIN"));
+    return false;
+  }
+
+  stopAll();
+  pressStartSteps = zAxis.positionSteps;
+  pressLiftSteps = 0;
+  pressCanLift = false;
+  pressForceThresholdG = forceThresholdG;
+  pressSpeedMM = pressSpeedRequested;
+  zAxis.direction = -1;
+  zAxis.remainingSteps =
+      static_cast<unsigned long>(lround(maxTravelMM * STEPS_PER_MM));
+  zAxis.periodTicks = timerPeriodForSpeed(pressSpeedMM);
+  setAxisDirection(zAxis, -1);
+  delayMicroseconds(DIR_SETUP_US);
+  zAxis.mode = MODE_PRESS;
+  startTimer(zAxis);
+  return true;
+}
+
+bool startLift() {
+  if (!pressCanLift || pressLiftSteps == 0) {
+    Serial.println(F("ERROR,NO_PRESS_TO_LIFT"));
+    return false;
+  }
+  if (!movementAllowed(zAxis, 1)) {
+    Serial.println(F("ERROR,LIMIT_BLOCKED,Z,ZPLUS"));
+    return false;
+  }
+
+  unsigned long steps = pressLiftSteps;
+  stopAll();
+  pressCanLift = false;
+  zAxis.direction = 1;
+  zAxis.remainingSteps = steps;
+  zAxis.periodTicks = timerPeriodForSpeed(pressSpeedMM);
+  setAxisDirection(zAxis, 1);
+  delayMicroseconds(DIR_SETUP_US);
+  zAxis.mode = MODE_LIFT;
+  startTimer(zAxis);
+  return true;
+}
+
 bool anyPumpRunning() {
   return pumps[0].running || pumps[1].running;
 }
@@ -417,6 +493,7 @@ bool startJog(AxisState &axis, int8_t direction) {
     return false;
   }
   stopAll();
+  if (axis.name == 'Z') pressCanLift = false;
   axis.direction = direction;
   axis.periodTicks = timerPeriodForSpeed(speedMM);
   setAxisDirection(axis, direction);
@@ -445,6 +522,7 @@ bool startRelativeMove(AxisState &axis, float distanceMM) {
     return false;
   }
   stopAll();
+  if (axis.name == 'Z') pressCanLift = false;
   axis.direction = direction;
   axis.remainingSteps = static_cast<unsigned long>(labs(signedSteps));
   axis.periodTicks = timerPeriodForSpeed(speedMM);
@@ -457,6 +535,7 @@ bool startRelativeMove(AxisState &axis, float distanceMM) {
 
 bool startHome(AxisState &axis) {
   stopAll();
+  if (axis.name == 'Z') pressCanLift = false;
 
   // An axis already resting on its MINUS switch is at machine zero.
   if (!movementAllowed(axis, -1)) {
@@ -504,15 +583,18 @@ ISR(TIMER1_COMPA_vect) {
   timerPulseHigh = false;
   axis->positionSteps += axis->direction;
 
-  if (axis->mode == MODE_MOVE) {
+  if (axis->mode == MODE_MOVE || axis->mode == MODE_PRESS ||
+      axis->mode == MODE_LIFT) {
     if (axis->remainingSteps > 0) axis->remainingSteps--;
     if (axis->remainingSteps == 0) {
       char axisName = axis->name;
+      MotionMode finishedMode = axis->mode;
       axis->mode = MODE_IDLE;
       axis->direction = 0;
       activeAxis = NULL;
       stopTimer();
       completedAxisName = axisName;
+      completedMotionMode = finishedMode;
       motionCompleted = true;
       return;
     }
@@ -640,7 +722,14 @@ void sendStatus(bool force) {
   Serial.print(F(",FR="));
   Serial.print(loadCellFilteredRaw);
   Serial.print(F(",F="));
-  Serial.println(loadCellTared ? loadCellForceGrams : 0.0f, 2);
+  Serial.print(loadCellTared ? loadCellForceGrams : 0.0f, 2);
+  Serial.print(F(",PR="));
+  Serial.print(zAxis.mode == MODE_PRESS ? 1 : (zAxis.mode == MODE_LIFT ? 2 : 0));
+  Serial.print(F(",PD="));
+  long pressDepth = pressStartSteps - zAxis.positionSteps;
+  Serial.println(pressDepth > 0 ?
+                     static_cast<float>(pressDepth) / STEPS_PER_MM : 0.0f,
+                 3);
 }
 
 bool parseFloatStrict(const char *token, float &value) {
@@ -668,16 +757,48 @@ void processCommand(char *command) {
     return;
   }
   if (strcmp(verb, "STOP") == 0) {
+    bool wasPressing = zAxis.mode == MODE_PRESS;
     stopAll();
+    if (wasPressing) capturePressLiftDistance();
     stopAllPumps();
     Serial.println(F("OK,STOP"));
     sendStatus(true);
     return;
   }
   if (strcmp(verb, "MOTION_STOP") == 0) {
+    bool wasPressing = zAxis.mode == MODE_PRESS;
     stopAll();
+    if (wasPressing) capturePressLiftDistance();
     Serial.println(F("OK,MOTION_STOP"));
     sendStatus(true);
+    return;
+  }
+  if (strcmp(verb, "PRESS") == 0) {
+    float forceThreshold;
+    float maxTravel;
+    float requestedPressSpeed;
+    if (!parseFloatStrict(strtok_r(NULL, " ", &savePointer), forceThreshold) ||
+        !parseFloatStrict(strtok_r(NULL, " ", &savePointer), maxTravel) ||
+        !parseFloatStrict(strtok_r(NULL, " ", &savePointer),
+                          requestedPressSpeed) ||
+        forceThreshold <= 0.0f || forceThreshold > MAX_PRESS_FORCE_G ||
+        maxTravel <= 0.0f || maxTravel > MAX_PRESS_TRAVEL_MM ||
+        requestedPressSpeed < MIN_PRESS_SPEED_MM_S ||
+        requestedPressSpeed > MAX_PRESS_SPEED_MM_S) {
+      Serial.println(F("ERROR,BAD_PRESS"));
+      return;
+    }
+    if (startPress(forceThreshold, maxTravel, requestedPressSpeed)) {
+      Serial.println(F("OK,PRESS_STARTED"));
+      sendStatus(true);
+    }
+    return;
+  }
+  if (strcmp(verb, "LIFT") == 0) {
+    if (startLift()) {
+      Serial.println(F("OK,LIFT_STARTED"));
+      sendStatus(true);
+    }
     return;
   }
   if (strcmp(verb, "TARE") == 0) {
@@ -910,6 +1031,16 @@ void loop() {
   serviceLoadCell();
 
   AxisState *axis = activeAxis;
+  if (axis != NULL && axis->mode == MODE_PRESS && loadCellTared &&
+      loadCellForceGrams >= pressForceThresholdG) {
+    stopAll();
+    capturePressLiftDistance();
+    Serial.print(F("EVENT,PRESS_FORCE_STOP,"));
+    Serial.println(loadCellForceGrams, 2);
+    sendStatus(true);
+    axis = NULL;
+  }
+
   if (axis != NULL && axis->name == 'Y' && anyYAlarm()) {
     bool y1 = alarmTriggered(Y1_ALARM);
     bool y2 = alarmTriggered(Y2_ALARM);
@@ -929,11 +1060,18 @@ void loop() {
     MotionMode stoppedMode = axis->mode;
     const char *limitName = activeLimitName(*axis, axis->direction);
     stopAll();
+    if (stoppedMode == MODE_PRESS) capturePressLiftDistance();
     if (stoppedMode == MODE_HOME) {
       axis->positionSteps = 0;
       axis->homed = true;
       Serial.print(F("EVENT,HOME_DONE,"));
       Serial.println(axisName);
+    } else if (stoppedMode == MODE_PRESS) {
+      Serial.print(F("EVENT,PRESS_LIMIT_STOP,"));
+      Serial.println(limitName);
+    } else if (stoppedMode == MODE_LIFT) {
+      Serial.print(F("EVENT,LIFT_LIMIT_STOP,"));
+      Serial.println(limitName);
     } else {
       Serial.print(F("EVENT,LIMIT_STOP,"));
       Serial.print(axisName);
@@ -945,7 +1083,9 @@ void loop() {
 
   if ((anyAxisMoving() || anyPumpRunning()) &&
       millis() - lastCommandMillis > COMMAND_WATCHDOG_MS) {
+    bool wasPressing = zAxis.mode == MODE_PRESS;
     stopAll();
+    if (wasPressing) capturePressLiftDistance();
     stopAllPumps();
     Serial.println(F("EVENT,WATCHDOG_STOP"));
     sendStatus(true);
@@ -954,10 +1094,20 @@ void loop() {
   if (motionCompleted) {
     noInterrupts();
     char axisName = completedAxisName;
+    MotionMode finishedMode = completedMotionMode;
     motionCompleted = false;
     interrupts();
-    Serial.print(F("EVENT,MOVE_DONE,"));
-    Serial.println(axisName);
+    if (finishedMode == MODE_PRESS) {
+      capturePressLiftDistance();
+      Serial.println(F("EVENT,PRESS_MAX_TRAVEL_STOP"));
+    } else if (finishedMode == MODE_LIFT) {
+      pressLiftSteps = 0;
+      pressCanLift = false;
+      Serial.println(F("EVENT,LIFT_DONE"));
+    } else {
+      Serial.print(F("EVENT,MOVE_DONE,"));
+      Serial.println(axisName);
+    }
     sendStatus(true);
   }
 

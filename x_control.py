@@ -1,4 +1,4 @@
-"""Milestone 5: motion, pumps, and S-type load-cell monitoring."""
+"""Milestone 6: force-limited Z press and lift control."""
 
 import sys
 import time
@@ -10,7 +10,7 @@ import serial.tools.list_ports
 
 
 BAUD_RATE = 115200
-CONTROLLER_ID = "MEGA_GANTRY_M5"
+CONTROLLER_ID = "MEGA_GANTRY_M6"
 DEFAULT_SPEED_MM_S = 2.0
 DEFAULT_PUMP_RPM = 2.0
 SERIAL_POLL_MS = 20
@@ -74,11 +74,14 @@ def parse_status_line(line):
     values["PUMP1RUNNING"] = packed_pumps[1]
 
     for key in (
-        "X", "Y", "Z", "SX", "SY", "SZ", "PI", "PO", "R", "FR", "F"
+        "X", "Y", "Z", "SX", "SY", "SZ", "PI", "PO", "R", "FR", "F",
+        "PR", "PD"
     ):
         float(values[key])
     if values.get("LC") not in ("0", "1") or values.get("T") not in ("0", "1"):
         raise ValueError("invalid load-cell state")
+    if values.get("PR") not in ("0", "1", "2"):
+        raise ValueError("invalid press state")
     return values
 
 
@@ -104,8 +107,8 @@ class GantryMotionUI(tk.Tk):
     def __init__(self):
         tk.Tk.__init__(self)
         self.title("Gantry Motion Control — Milestone 5")
-        self.geometry("900x800")
-        self.minsize(800, 720)
+        self.geometry("900x740")
+        self.minsize(800, 680)
         self.option_add("*Font", ("Segoe UI", 9))
 
         self.serial_port = None
@@ -145,6 +148,10 @@ class GantryMotionUI(tk.Tk):
         self.load_cell_filtered_var = tk.StringVar(value="—")
         self.load_cell_force_var = tk.StringVar(value="— g")
         self.load_cell_status_var = tk.StringVar(value="WAITING")
+        self.press_force_var = tk.DoubleVar(value=100.0)
+        self.press_travel_var = tk.DoubleVar(value=20.0)
+        self.press_speed_var = tk.DoubleVar(value=0.25)
+        self.press_status_var = tk.StringVar(value="IDLE")
         self.limit_vars = {
             name: tk.StringVar(value="SAFE") for name in self.LIMITS
         }
@@ -166,18 +173,10 @@ class GantryMotionUI(tk.Tk):
 
     def build_ui(self):
         self.columnconfigure(0, weight=1)
-        self.rowconfigure(1, weight=1)
+        self.rowconfigure(0, weight=1)
 
-        title = ttk.Label(
-            self,
-            text="XYZ POSITION / MOTION",
-            anchor="center",
-            font=("Segoe UI", 16, "bold"),
-        )
-        title.grid(row=0, column=0, sticky="ew", padx=12, pady=(8, 4))
-
-        body = ttk.Frame(self, padding=(12, 4, 12, 10))
-        body.grid(row=1, column=0, sticky="nsew")
+        body = ttk.Frame(self, padding=(10, 4, 10, 6))
+        body.grid(row=0, column=0, sticky="nsew")
         body.columnconfigure(0, weight=1)
 
         self.build_connection_panel(body)
@@ -192,8 +191,8 @@ class GantryMotionUI(tk.Tk):
         self.build_stop_panel(body)
 
     def build_connection_panel(self, parent):
-        frame = ttk.LabelFrame(parent, text="Arduino Mega connection", padding=6)
-        frame.grid(row=0, column=0, sticky="ew", pady=(0, 4))
+        frame = ttk.LabelFrame(parent, text="Arduino Mega connection", padding=4)
+        frame.grid(row=0, column=0, sticky="ew", pady=(0, 2))
         frame.columnconfigure(1, weight=1)
 
         ttk.Label(frame, text="Serial port:").grid(row=0, column=0, padx=(0, 8))
@@ -219,8 +218,8 @@ class GantryMotionUI(tk.Tk):
         self.connection_label.grid(row=0, column=4, padx=(12, 0))
 
     def build_position_panel(self, parent):
-        frame = ttk.LabelFrame(parent, text="Coordinate system", padding=6)
-        frame.grid(row=1, column=0, sticky="ew", pady=4)
+        frame = ttk.LabelFrame(parent, text="Coordinate system", padding=4)
+        frame.grid(row=1, column=0, sticky="ew", pady=2)
         frame.columnconfigure(0, weight=0)
         for column in range(1, 4):
             frame.columnconfigure(column, weight=1)
@@ -256,8 +255,8 @@ class GantryMotionUI(tk.Tk):
             ).grid(row=4, column=column, sticky="ew")
 
     def build_jog_panel(self, parent):
-        frame = ttk.LabelFrame(parent, text="Jog — hold to move", padding=6)
-        frame.grid(row=2, column=0, sticky="ew", pady=4)
+        frame = ttk.LabelFrame(parent, text="Jog — hold to move", padding=4)
+        frame.grid(row=2, column=0, sticky="ew", pady=2)
         for column in range(3):
             frame.columnconfigure(column, weight=1)
 
@@ -287,8 +286,8 @@ class GantryMotionUI(tk.Tk):
             self.motion_widgets.extend((minus, plus))
 
     def build_relative_move_panel(self, parent):
-        frame = ttk.LabelFrame(parent, text="Relative move", padding=6)
-        frame.grid(row=4, column=0, sticky="ew", pady=4)
+        frame = ttk.LabelFrame(parent, text="Relative move", padding=4)
+        frame.grid(row=4, column=0, sticky="ew", pady=2)
         frame.columnconfigure(3, weight=1)
 
         ttk.Label(frame, text="Axis:").grid(row=0, column=0, padx=(0, 6))
@@ -335,9 +334,9 @@ class GantryMotionUI(tk.Tk):
 
     def build_home_panel(self, parent):
         frame = ttk.LabelFrame(
-            parent, text="Homing / scan coordinate", padding=6
+            parent, text="Homing / scan coordinate", padding=4
         )
-        frame.grid(row=3, column=0, sticky="ew", pady=4)
+        frame.grid(row=3, column=0, sticky="ew", pady=2)
         for column in range(4):
             frame.columnconfigure(column, weight=1)
 
@@ -359,8 +358,8 @@ class GantryMotionUI(tk.Tk):
         self.motion_widgets.append(scan_zero_button)
 
     def build_limit_panel(self, parent):
-        frame = ttk.LabelFrame(parent, text="Limit switches", padding=6)
-        frame.grid(row=5, column=0, sticky="ew", pady=4)
+        frame = ttk.LabelFrame(parent, text="Limit switches", padding=4)
+        frame.grid(row=5, column=0, sticky="ew", pady=2)
         for column in range(6):
             frame.columnconfigure(column, weight=1)
 
@@ -386,7 +385,7 @@ class GantryMotionUI(tk.Tk):
 
     def build_stop_panel(self, parent):
         frame = ttk.Frame(parent)
-        frame.grid(row=9, column=0, sticky="ew", pady=(5, 0))
+        frame.grid(row=9, column=0, sticky="ew", pady=(2, 0))
         frame.columnconfigure(0, weight=1)
 
         self.stop_button = tk.Button(
@@ -408,8 +407,8 @@ class GantryMotionUI(tk.Tk):
         )
 
     def build_alarm_panel(self, parent):
-        frame = ttk.LabelFrame(parent, text="Y driver alarms", padding=6)
-        frame.grid(row=8, column=0, sticky="ew", pady=4)
+        frame = ttk.LabelFrame(parent, text="Y driver alarms", padding=4)
+        frame.grid(row=8, column=0, sticky="ew", pady=2)
         for column in range(2):
             frame.columnconfigure(column, weight=1)
 
@@ -427,8 +426,8 @@ class GantryMotionUI(tk.Tk):
             self.alarm_labels[key] = (label, display_name)
 
     def build_pump_panel(self, parent):
-        frame = ttk.LabelFrame(parent, text="Peristaltic pumps — clockwise", padding=6)
-        frame.grid(row=7, column=0, sticky="ew", pady=4)
+        frame = ttk.LabelFrame(parent, text="Peristaltic pumps — clockwise", padding=4)
+        frame.grid(row=7, column=0, sticky="ew", pady=2)
         for column in range(2):
             frame.columnconfigure(column, weight=1)
 
@@ -444,7 +443,7 @@ class GantryMotionUI(tk.Tk):
                 pump_frame, textvariable=self.pump_status_vars[pump_id]
             ).grid(row=0, column=1, sticky="w")
 
-            ttk.Label(pump_frame, text="Speed:").grid(row=1, column=0, pady=(8, 0))
+            ttk.Label(pump_frame, text="Speed:").grid(row=1, column=0, pady=(3, 0))
             speed_box = ttk.Spinbox(
                 pump_frame,
                 from_=0.1,
@@ -454,13 +453,13 @@ class GantryMotionUI(tk.Tk):
                 width=8,
                 command=lambda selected=pump_id: self.apply_pump_speed(selected),
             )
-            speed_box.grid(row=1, column=1, sticky="w", pady=(8, 0))
+            speed_box.grid(row=1, column=1, sticky="w", pady=(3, 0))
             speed_box.bind(
                 "<Return>",
                 lambda event, selected=pump_id: self.apply_pump_speed(selected),
             )
             ttk.Label(pump_frame, text="RPM").grid(
-                row=1, column=1, sticky="w", padx=(70, 0), pady=(8, 0)
+                row=1, column=1, sticky="w", padx=(70, 0), pady=(3, 0)
             )
 
             start_button = ttk.Button(
@@ -473,13 +472,13 @@ class GantryMotionUI(tk.Tk):
                 text="STOP",
                 command=lambda selected=pump_id: self.stop_pump(selected),
             )
-            start_button.grid(row=2, column=0, sticky="ew", pady=(8, 0), padx=(0, 4))
-            stop_button.grid(row=2, column=1, sticky="ew", pady=(8, 0), padx=(4, 0))
+            start_button.grid(row=2, column=0, sticky="ew", pady=(3, 0), padx=(0, 4))
+            stop_button.grid(row=2, column=1, sticky="ew", pady=(3, 0), padx=(4, 0))
             self.motion_widgets.extend((speed_box, start_button, stop_button))
 
     def build_load_cell_panel(self, parent):
-        frame = ttk.LabelFrame(parent, text="S-type load cell", padding=6)
-        frame.grid(row=6, column=0, sticky="ew", pady=4)
+        frame = ttk.LabelFrame(parent, text="S-type load cell", padding=4)
+        frame.grid(row=6, column=0, sticky="ew", pady=2)
         for column in range(8):
             frame.columnconfigure(column, weight=1 if column in (1, 3, 5) else 0)
 
@@ -503,6 +502,44 @@ class GantryMotionUI(tk.Tk):
         tare_button = ttk.Button(frame, text="TARE", command=self.tare_load_cell)
         tare_button.grid(row=0, column=7)
         self.motion_widgets.append(tare_button)
+
+        ttk.Label(frame, text="Press force:").grid(row=1, column=0, pady=(5, 0))
+        force_box = ttk.Spinbox(
+            frame, from_=0.1, to=5000.0, increment=1.0,
+            textvariable=self.press_force_var, width=7
+        )
+        force_box.grid(row=1, column=1, sticky="w", pady=(5, 0))
+        ttk.Label(frame, text="Max travel:").grid(row=1, column=2, pady=(5, 0))
+        travel_box = ttk.Spinbox(
+            frame, from_=0.1, to=50.0, increment=0.5,
+            textvariable=self.press_travel_var, width=7
+        )
+        travel_box.grid(row=1, column=3, sticky="w", pady=(5, 0))
+        ttk.Label(frame, text="Speed:").grid(row=1, column=4, pady=(5, 0))
+        speed_box = ttk.Spinbox(
+            frame, from_=0.05, to=0.50, increment=0.05,
+            textvariable=self.press_speed_var, width=6
+        )
+        speed_box.grid(row=1, column=5, sticky="w", pady=(5, 0))
+        press_button = ttk.Button(frame, text="PRESS", command=self.start_press)
+        press_button.grid(row=1, column=6, pady=(5, 0), padx=(0, 4))
+        button_frame = ttk.Frame(frame)
+        button_frame.grid(row=1, column=7, pady=(5, 0))
+        press_stop_button = ttk.Button(
+            button_frame, text="STOP", command=self.stop_press, width=6
+        )
+        lift_button = ttk.Button(
+            button_frame, text="LIFT", command=self.lift_press, width=6
+        )
+        press_stop_button.grid(row=0, column=0, padx=(0, 3))
+        lift_button.grid(row=0, column=1)
+        ttk.Label(frame, textvariable=self.press_status_var).grid(
+            row=2, column=0, columnspan=8, sticky="w", pady=(4, 0)
+        )
+        self.motion_widgets.extend(
+            (force_box, travel_box, speed_box, press_button,
+             press_stop_button, lift_button)
+        )
 
     def refresh_ports(self):
         if self.is_serial_open():
@@ -596,6 +633,7 @@ class GantryMotionUI(tk.Tk):
         self.load_cell_filtered_var.set("—")
         self.load_cell_force_var.set("— g")
         self.load_cell_status_var.set("WAITING")
+        self.press_status_var.set("IDLE")
 
     def is_serial_open(self):
         return self.serial_port is not None and self.serial_port.is_open
@@ -680,6 +718,26 @@ class GantryMotionUI(tk.Tk):
 
         if line.startswith("EVENT,") or line.startswith("ERROR,"):
             self.status_var.set(line)
+            if line.startswith("EVENT,PRESS_FORCE_STOP"):
+                self.press_status_var.set("STOPPED — FORCE THRESHOLD")
+            elif line.startswith("EVENT,PRESS_MAX_TRAVEL_STOP"):
+                self.press_status_var.set("STOPPED — MAX TRAVEL")
+            elif line.startswith("EVENT,PRESS_LIMIT_STOP"):
+                self.press_status_var.set("STOPPED — Z LIMIT")
+            elif line.startswith("EVENT,LIFT_DONE"):
+                self.press_status_var.set("LIFT COMPLETE")
+            elif line.startswith("ERROR,LOAD_CELL_NOT_READY"):
+                self.press_status_var.set("PRESS REJECTED — LOAD CELL NOT READY")
+            elif line.startswith("ERROR,FORCE_ALREADY_AT_THRESHOLD"):
+                self.press_status_var.set("PRESS REJECTED — FORCE ALREADY HIGH")
+            elif line.startswith("ERROR,LIMIT_BLOCKED,Z,ZMIN"):
+                self.press_status_var.set("PRESS REJECTED — Z− LIMIT")
+            elif line.startswith("ERROR,LIMIT_BLOCKED,Z,ZPLUS"):
+                self.press_status_var.set("LIFT REJECTED — Z+ LIMIT")
+            elif line.startswith("ERROR,BAD_PRESS"):
+                self.press_status_var.set("PRESS REJECTED — BAD PARAMETERS")
+            elif line.startswith("ERROR,NO_PRESS_TO_LIFT"):
+                self.press_status_var.set("LIFT REJECTED — NO PRESS DISTANCE")
             if (
                 "STOP" in line
                 or "LIMIT" in line
@@ -736,6 +794,20 @@ class GantryMotionUI(tk.Tk):
                 )
             else:
                 self.load_cell_status_var.set("WAITING")
+            press_state = values["PR"]
+            if press_state == "1":
+                self.press_status_var.set(
+                    "PRESSING — {:.3f} mm".format(float(values["PD"]))
+                )
+            elif press_state == "2":
+                self.press_status_var.set("LIFTING")
+            else:
+                current_press_status = self.press_status_var.get()
+                if (
+                    current_press_status.startswith("PRESSING")
+                    or current_press_status == "LIFTING"
+                ):
+                    self.press_status_var.set("IDLE")
         except (KeyError, ValueError):
             self.status_var.set("Invalid STATUS: {}".format(line))
 
@@ -843,6 +915,41 @@ class GantryMotionUI(tk.Tk):
     def tare_load_cell(self):
         self.load_cell_status_var.set("TARING")
         self.send_command("TARE")
+
+    def validated_press_parameters(self):
+        try:
+            force = float(self.press_force_var.get())
+            travel = float(self.press_travel_var.get())
+            speed = float(self.press_speed_var.get())
+        except (tk.TclError, ValueError):
+            self.status_var.set("Press parameters must be numbers")
+            return None
+        if not 0.0 < force <= 5000.0:
+            self.status_var.set("Press force must be within 0–5000 g")
+            return None
+        if not 0.0 < travel <= 50.0:
+            self.status_var.set("Press travel must be within 0–50 mm")
+            return None
+        if not 0.05 <= speed <= 0.50:
+            self.status_var.set("Press speed must be within 0.05–0.50 mm/s")
+            return None
+        return force, travel, speed
+
+    def start_press(self):
+        parameters = self.validated_press_parameters()
+        if parameters is None:
+            return
+        force, travel, speed = parameters
+        self.press_status_var.set("PRESS COMMAND SENT")
+        self.send_command(
+            "PRESS {:.2f} {:.3f} {:.3f}".format(force, travel, speed)
+        )
+
+    def stop_press(self):
+        self.send_command("MOTION_STOP")
+
+    def lift_press(self):
+        self.send_command("LIFT")
 
     def emergency_stop(self):
         self.send_command("STOP", require_ready=False)
