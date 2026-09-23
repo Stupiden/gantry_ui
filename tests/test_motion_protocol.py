@@ -185,6 +185,18 @@ class MotionProtocolTests(unittest.TestCase):
         self.assertIn('self.send_command("MOTION_STOP")', ui)
         self.assertIn('self.send_command("LIFT")', ui)
 
+    def test_milestone_seven_only_detects_and_connects_gamry(self):
+        ui = (ROOT / "x_control.py").read_text(encoding="utf-8")
+        self.assertIn("import toolkitpy as tkp", ui)
+        self.assertIn('tkp.toolkitpy_init("gantry_ui.py")', ui)
+        self.assertIn('tkp.Pstat("PSTAT")', ui)
+        self.assertIn("tkp.pstat_is_valid", ui)
+        self.assertIn("tkp.toolkitpy_close()", ui)
+        self.assertIn("self.gamry_pstat.set_cell(False)", ui)
+        self.assertIn('struct.calcsize("P") * 8 != 32', ui)
+        self.assertNotIn("GamryDtaq", ui)
+        self.assertNotIn("Start CV", ui)
+
     def test_python_sources_parse_on_python_37_grammar(self):
         for relative_path in ("x_control.py", "tests/test_motion_protocol.py"):
             source = (ROOT / relative_path).read_text(encoding="utf-8")

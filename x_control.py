@@ -1,12 +1,18 @@
-"""Milestone 6: force-limited Z press and lift control."""
+"""Milestone 7: motion, force control, and Gamry connection status."""
 
 import sys
+import struct
 import time
 import tkinter as tk
 from tkinter import messagebox, ttk
 
 import serial
 import serial.tools.list_ports
+
+try:
+    import toolkitpy as tkp
+except ImportError:
+    tkp = None
 
 
 BAUD_RATE = 115200
@@ -106,7 +112,7 @@ class GantryMotionUI(tk.Tk):
 
     def __init__(self):
         tk.Tk.__init__(self)
-        self.title("Gantry Motion Control — Milestone 5")
+        self.title("Gantry Motion Control — Milestone 7")
         self.geometry("900x740")
         self.minsize(800, 680)
         self.option_add("*Font", ("Segoe UI", 9))
@@ -120,9 +126,13 @@ class GantryMotionUI(tk.Tk):
         self.last_keepalive = 0.0
         self.last_ports = []
         self.rx_buffer = b""
+        self.gamry_pstat = None
+        self.gamry_toolkit_initialized = False
 
         self.port_var = tk.StringVar()
         self.connection_var = tk.StringVar(value="● DISCONNECTED")
+        self.gamry_device_var = tk.StringVar(value="PSTAT")
+        self.gamry_status_var = tk.StringVar(value="● NOT DETECTED")
         self.status_var = tk.StringVar(value="Ready")
         self.speed_var = tk.DoubleVar(value=DEFAULT_SPEED_MM_S)
         self.move_axis_var = tk.StringVar(value="X")
@@ -191,7 +201,7 @@ class GantryMotionUI(tk.Tk):
         self.build_stop_panel(body)
 
     def build_connection_panel(self, parent):
-        frame = ttk.LabelFrame(parent, text="Arduino Mega connection", padding=4)
+        frame = ttk.LabelFrame(parent, text="Connections", padding=4)
         frame.grid(row=0, column=0, sticky="ew", pady=(0, 2))
         frame.columnconfigure(1, weight=1)
 
@@ -216,6 +226,130 @@ class GantryMotionUI(tk.Tk):
             font=("Segoe UI", 10, "bold"),
         )
         self.connection_label.grid(row=0, column=4, padx=(12, 0))
+
+        ttk.Label(frame, text="Gamry:").grid(
+            row=1, column=0, padx=(0, 8), pady=(3, 0)
+        )
+        self.gamry_device_box = ttk.Combobox(
+            frame,
+            textvariable=self.gamry_device_var,
+            values=("PSTAT",),
+            state="readonly",
+            width=42,
+        )
+        self.gamry_device_box.grid(
+            row=1, column=1, sticky="ew", pady=(3, 0)
+        )
+        self.gamry_detect_button = ttk.Button(
+            frame, text="DETECT", command=self.detect_gamry
+        )
+        self.gamry_detect_button.grid(
+            row=1, column=2, padx=8, pady=(3, 0)
+        )
+        self.gamry_connect_button = ttk.Button(
+            frame, text="CONNECT", command=self.toggle_gamry_connection
+        )
+        self.gamry_connect_button.grid(row=1, column=3, pady=(3, 0))
+        self.gamry_status_label = tk.Label(
+            frame,
+            textvariable=self.gamry_status_var,
+            fg="#666666",
+            font=("Segoe UI", 9, "bold"),
+        )
+        self.gamry_status_label.grid(row=1, column=4, padx=(12, 0), pady=(3, 0))
+
+    def ensure_gamry_environment(self):
+        if tkp is None:
+            raise RuntimeError("Gamry ToolkitPy is not installed")
+        if struct.calcsize("P") * 8 != 32:
+            raise RuntimeError("Gamry requires the 32-bit Python 3.7.9 environment")
+
+    def initialize_gamry_toolkit(self):
+        self.ensure_gamry_environment()
+        if not self.gamry_toolkit_initialized:
+            tkp.toolkitpy_init("gantry_ui.py")
+            self.gamry_toolkit_initialized = True
+
+    def close_gamry_toolkit(self):
+        if self.gamry_toolkit_initialized:
+            tkp.toolkitpy_close()
+            self.gamry_toolkit_initialized = False
+
+    def detect_gamry(self):
+        if self.gamry_pstat is not None:
+            self.gamry_status_var.set("● DISCONNECT BEFORE DETECT")
+            self.gamry_status_label.configure(fg="#9a6700")
+            return
+        detected_pstat = None
+        try:
+            self.initialize_gamry_toolkit()
+            detected_pstat = tkp.Pstat("PSTAT")
+            if not tkp.pstat_is_valid(detected_pstat):
+                raise RuntimeError("PSTAT handle is not valid")
+        except Exception as error:
+            self.gamry_status_var.set("● DETECTION ERROR")
+            self.gamry_status_label.configure(fg="#b00020")
+            self.status_var.set("Gamry detection failed: {}".format(error))
+            detected_pstat = None
+            try:
+                self.close_gamry_toolkit()
+            except Exception:
+                pass
+            return
+        finally:
+            detected_pstat = None
+
+        self.close_gamry_toolkit()
+        self.gamry_status_var.set("● PSTAT DETECTED")
+        self.gamry_status_label.configure(fg="#187a2f")
+        self.status_var.set("Gamry PSTAT detected with ToolkitPy")
+
+    def toggle_gamry_connection(self):
+        if self.gamry_pstat is not None:
+            self.disconnect_gamry()
+        else:
+            self.connect_gamry()
+
+    def connect_gamry(self):
+        try:
+            self.initialize_gamry_toolkit()
+            self.gamry_pstat = tkp.Pstat("PSTAT")
+            if not tkp.pstat_is_valid(self.gamry_pstat):
+                raise RuntimeError("PSTAT handle is not valid")
+        except Exception as error:
+            self.gamry_pstat = None
+            try:
+                self.close_gamry_toolkit()
+            except Exception:
+                pass
+            self.gamry_status_var.set("● CONNECTION ERROR")
+            self.gamry_status_label.configure(fg="#b00020")
+            self.status_var.set("Gamry connection failed: {}".format(error))
+            return
+
+        self.gamry_connect_button.configure(text="DISCONNECT")
+        self.gamry_detect_button.configure(state="disabled")
+        self.gamry_device_box.configure(state="disabled")
+        self.gamry_status_var.set("● CONNECTED")
+        self.gamry_status_label.configure(fg="#187a2f")
+        self.status_var.set("Gamry connected: PSTAT")
+
+    def disconnect_gamry(self):
+        if self.gamry_pstat is not None:
+            try:
+                self.gamry_pstat.set_cell(False)
+            except Exception as error:
+                self.status_var.set("Gamry close warning: {}".format(error))
+        self.gamry_pstat = None
+        try:
+            self.close_gamry_toolkit()
+        except Exception as error:
+            self.status_var.set("Gamry ToolkitPy close warning: {}".format(error))
+        self.gamry_connect_button.configure(text="CONNECT")
+        self.gamry_detect_button.configure(state="normal")
+        self.gamry_device_box.configure(state="readonly")
+        self.gamry_status_var.set("● DISCONNECTED")
+        self.gamry_status_label.configure(fg="#666666")
 
     def build_position_panel(self, parent):
         frame = ttk.LabelFrame(parent, text="Coordinate system", padding=4)
@@ -957,6 +1091,10 @@ class GantryMotionUI(tk.Tk):
         self.status_var.set("STOP sent")
 
     def on_close(self):
+        if self.gamry_pstat is not None:
+            self.disconnect_gamry()
+        if self.gamry_toolkit_initialized:
+            self.close_gamry_toolkit()
         if self.is_serial_open():
             try:
                 self.serial_port.write(b"STOP\n")
