@@ -222,10 +222,29 @@ class MotionProtocolTests(unittest.TestCase):
         self.assertNotIn("GamryCA", cv)
         self.assertNotIn("GamryEIS", cv)
 
+    def test_manual_ca_matches_verified_mg400_parameters(self):
+        ui = (ROOT / "x_control.py").read_text(encoding="utf-8")
+        ca = (ROOT / "gamry_ca_manual.py").read_text(encoding="utf-8")
+        self.assertIn("ManualCAWindow", ui)
+        self.assertIn("signal_d_step_new", ca)
+        self.assertIn("ChronoCurve", ca)
+        self.assertIn("self.signal = self.pstat.signal_d_step_new", ca)
+        self.assertIn("self.vinit_var = tk.DoubleVar(value=0.0)", ca)
+        self.assertIn("self.vstep1_var = tk.DoubleVar(value=0.0)", ca)
+        self.assertIn("self.tstep1_var = tk.DoubleVar(value=3.0)", ca)
+        self.assertIn("self.vstep2_var = tk.DoubleVar(value=0.0)", ca)
+        self.assertIn("self.sample_period_var = tk.DoubleVar(value=0.005)", ca)
+        self.assertIn("set_cell(True)", ca)
+        self.assertIn("set_cell(False)", ca)
+        self.assertIn("self.curve.stop()", ca)
+        self.assertIn("self.gamry_measurement_owner", ui)
+        self.assertNotIn("GamryEIS", ca)
+
     def test_python_sources_parse_on_python_37_grammar(self):
         for relative_path in (
             "x_control.py",
             "gamry_cv_manual.py",
+            "gamry_ca_manual.py",
             "tests/test_motion_protocol.py",
         ):
             source = (ROOT / relative_path).read_text(encoding="utf-8")

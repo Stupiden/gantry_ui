@@ -37,7 +37,10 @@ def initialize_pstat_for_cv(pstat, tkp):
 class ManualCVWindow(tk.Toplevel):
     POLL_MS = 50
 
-    def __init__(self, parent, pstat, tkp, position_provider):
+    def __init__(
+        self, parent, pstat, tkp, position_provider,
+        claim_measurement=None, release_measurement=None
+    ):
         tk.Toplevel.__init__(self, parent)
         self.title("Manual Gamry CV")
         self.geometry("900x680")
@@ -45,6 +48,9 @@ class ManualCVWindow(tk.Toplevel):
         self.pstat = pstat
         self.tkp = tkp
         self.position_provider = position_provider
+        self.claim_measurement = claim_measurement
+        self.release_measurement = release_measurement
+        self.measurement_claimed = False
         self.curve = None
         self.signal = None
         self.running = False
@@ -199,6 +205,10 @@ class ManualCVWindow(tk.Toplevel):
             return
         try:
             params = self._parameters()
+            if self.claim_measurement is not None:
+                if not self.claim_measurement("CV"):
+                    raise RuntimeError("Another Gamry measurement is already running")
+                self.measurement_claimed = True
             if not self.tkp.pstat_is_valid(self.pstat):
                 raise RuntimeError("PSTAT connection is not valid")
             csv_path = Path(self.csv_var.get()).expanduser()
@@ -249,6 +259,7 @@ class ManualCVWindow(tk.Toplevel):
             self.after(self.POLL_MS, self._poll_cv)
         except Exception as error:
             self._safe_hardware_off()
+            self._release_measurement()
             messagebox.showerror("CV start failed", str(error), parent=self)
             self.status_var.set("START FAILED: {}".format(error))
 
@@ -381,8 +392,14 @@ class ManualCVWindow(tk.Toplevel):
         self.curve = None
         self.signal = None
         self.curve_started = False
+        self._release_measurement()
         self._set_controls_running(False)
         self.status_var.set(status)
+
+    def _release_measurement(self):
+        if self.measurement_claimed and self.release_measurement is not None:
+            self.release_measurement("CV")
+        self.measurement_claimed = False
 
     def _set_controls_running(self, running):
         state = "disabled" if running else "normal"

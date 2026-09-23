@@ -10,6 +10,7 @@ import serial
 import serial.tools.list_ports
 
 from gamry_cv_manual import ManualCVWindow
+from gamry_ca_manual import ManualCAWindow
 
 try:
     import toolkitpy as tkp
@@ -131,6 +132,8 @@ class GantryMotionUI(tk.Tk):
         self.gamry_pstat = None
         self.gamry_toolkit_initialized = False
         self.cv_window = None
+        self.ca_window = None
+        self.gamry_measurement_owner = None
 
         self.port_var = tk.StringVar()
         self.connection_var = tk.StringVar(value="● DISCONNECTED")
@@ -264,6 +267,10 @@ class GantryMotionUI(tk.Tk):
             frame, text="MANUAL CV", command=self.open_cv_window, state="disabled"
         )
         self.cv_button.grid(row=1, column=5, padx=(8, 0), pady=(3, 0))
+        self.ca_button = ttk.Button(
+            frame, text="MANUAL CA", command=self.open_ca_window, state="disabled"
+        )
+        self.ca_button.grid(row=1, column=6, padx=(5, 0), pady=(3, 0))
 
     def ensure_gamry_environment(self):
         if tkp is None:
@@ -338,6 +345,7 @@ class GantryMotionUI(tk.Tk):
         self.gamry_detect_button.configure(state="disabled")
         self.gamry_device_box.configure(state="disabled")
         self.cv_button.configure(state="normal")
+        self.ca_button.configure(state="normal")
         self.gamry_status_var.set("● CONNECTED")
         self.gamry_status_label.configure(fg="#187a2f")
         self.status_var.set("Gamry connected: PSTAT")
@@ -345,6 +353,9 @@ class GantryMotionUI(tk.Tk):
     def disconnect_gamry(self):
         if self.cv_window is not None and self.cv_window.running:
             self.status_var.set("Stop CV before disconnecting Gamry")
+            return
+        if self.ca_window is not None and self.ca_window.running:
+            self.status_var.set("Stop CA before disconnecting Gamry")
             return
         if self.gamry_pstat is not None:
             try:
@@ -360,6 +371,7 @@ class GantryMotionUI(tk.Tk):
         self.gamry_detect_button.configure(state="normal")
         self.gamry_device_box.configure(state="readonly")
         self.cv_button.configure(state="disabled")
+        self.ca_button.configure(state="disabled")
         self.gamry_status_var.set("● DISCONNECTED")
         self.gamry_status_label.configure(fg="#666666")
 
@@ -379,8 +391,43 @@ class GantryMotionUI(tk.Tk):
             self.cv_window.focus_force()
             return
         self.cv_window = ManualCVWindow(
-            self, self.gamry_pstat, tkp, self.current_machine_position
+            self,
+            self.gamry_pstat,
+            tkp,
+            self.current_machine_position,
+            self.claim_gamry_measurement,
+            self.release_gamry_measurement,
         )
+
+    def open_ca_window(self):
+        if self.gamry_pstat is None:
+            self.status_var.set("Connect Gamry before opening manual CA")
+            return
+        if self.ca_window is not None and self.ca_window.winfo_exists():
+            self.ca_window.lift()
+            self.ca_window.focus_force()
+            return
+        self.ca_window = ManualCAWindow(
+            self,
+            self.gamry_pstat,
+            tkp,
+            self.current_machine_position,
+            self.claim_gamry_measurement,
+            self.release_gamry_measurement,
+        )
+
+    def claim_gamry_measurement(self, owner):
+        if self.gamry_measurement_owner is not None:
+            self.status_var.set(
+                "Gamry is busy with {}".format(self.gamry_measurement_owner)
+            )
+            return False
+        self.gamry_measurement_owner = owner
+        return True
+
+    def release_gamry_measurement(self, owner):
+        if self.gamry_measurement_owner == owner:
+            self.gamry_measurement_owner = None
 
     def build_position_panel(self, parent):
         frame = ttk.LabelFrame(parent, text="Coordinate system", padding=4)
@@ -1119,6 +1166,8 @@ class GantryMotionUI(tk.Tk):
     def emergency_stop(self):
         if self.cv_window is not None and self.cv_window.winfo_exists():
             self.cv_window.stop_cv()
+        if self.ca_window is not None and self.ca_window.winfo_exists():
+            self.ca_window.stop_ca()
         self.send_command("STOP", require_ready=False)
         self.jog_axis = None
         self.status_var.set("STOP sent")
@@ -1126,6 +1175,8 @@ class GantryMotionUI(tk.Tk):
     def on_close(self):
         if self.cv_window is not None and self.cv_window.winfo_exists():
             self.cv_window.shutdown()
+        if self.ca_window is not None and self.ca_window.winfo_exists():
+            self.ca_window.shutdown()
         if self.gamry_pstat is not None:
             self.disconnect_gamry()
         if self.gamry_toolkit_initialized:
