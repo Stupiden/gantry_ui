@@ -29,7 +29,7 @@ class MotionProtocolTests(unittest.TestCase):
     def test_compact_status_expands_positions_limits_and_motion(self):
         values = parse_status_line(
             "STATUS,X=1.250,Y=-2.000,Z=0.006,SX=0.250,SY=-3.000,SZ=0.000,"
-            "L=010101,M=101,H=110,A=01"
+            "L=010101,M=101,H=110,A=01,P=10,PI=2.00,PO=3.50"
         )
         self.assertEqual(values["X"], "1.250")
         self.assertEqual(values["YMIN"], "0")
@@ -42,16 +42,20 @@ class MotionProtocolTests(unittest.TestCase):
         self.assertEqual(values["ZHOMED"], "0")
         self.assertEqual(values["Y1ALARM"], "0")
         self.assertEqual(values["Y2ALARM"], "1")
+        self.assertEqual(values["PUMP0RUNNING"], "1")
+        self.assertEqual(values["PUMP1RUNNING"], "0")
+        self.assertEqual(values["PO"], "3.50")
 
     def test_bad_status_is_rejected(self):
         bad_lines = (
             "OK,STOP",
-            "STATUS,X=0,Y=0,Z=0,SX=0,SY=0,SZ=0,L=00000,M=000,H=000,A=00",
-            "STATUS,X=0,Y=0,Z=0,SX=0,SY=0,SZ=0,L=00000X,M=000,H=000,A=00",
-            "STATUS,X=0,Y=0,Z=0,SX=0,SY=0,SZ=0,L=000000,M=00,H=000,A=00",
-            "STATUS,X=no,Y=0,Z=0,SX=0,SY=0,SZ=0,L=000000,M=000,H=000,A=00",
-            "STATUS,X=0,Y=0,Z=0,SX=0,SY=0,SZ=0,L=000000,M=000,H=00,A=00",
-            "STATUS,X=0,Y=0,Z=0,SX=0,SY=0,SZ=0,L=000000,M=000,H=000,A=0",
+            "STATUS,X=0,Y=0,Z=0,SX=0,SY=0,SZ=0,L=00000,M=000,H=000,A=00,P=00,PI=2,PO=2",
+            "STATUS,X=0,Y=0,Z=0,SX=0,SY=0,SZ=0,L=00000X,M=000,H=000,A=00,P=00,PI=2,PO=2",
+            "STATUS,X=0,Y=0,Z=0,SX=0,SY=0,SZ=0,L=000000,M=00,H=000,A=00,P=00,PI=2,PO=2",
+            "STATUS,X=no,Y=0,Z=0,SX=0,SY=0,SZ=0,L=000000,M=000,H=000,A=00,P=00,PI=2,PO=2",
+            "STATUS,X=0,Y=0,Z=0,SX=0,SY=0,SZ=0,L=000000,M=000,H=00,A=00,P=00,PI=2,PO=2",
+            "STATUS,X=0,Y=0,Z=0,SX=0,SY=0,SZ=0,L=000000,M=000,H=000,A=0,P=00,PI=2,PO=2",
+            "STATUS,X=0,Y=0,Z=0,SX=0,SY=0,SZ=0,L=000000,M=000,H=000,A=00,P=0,PI=2,PO=2",
         )
         for line in bad_lines:
             with self.assertRaises(ValueError):
@@ -63,24 +67,25 @@ class MotionProtocolTests(unittest.TestCase):
         self.assertEqual(lines, [])
         lines, buffer = extract_complete_lines(
             buffer,
-            b"GANTRY_M3\r\nSTATUS,X=0,Y=0,Z=0,SX=0,SY=0,SZ=0,"
-            b"L=000000,M=000,H=000,A=00\n",
+            b"GANTRY_M4\r\nSTATUS,X=0,Y=0,Z=0,SX=0,SY=0,SZ=0,"
+            b"L=000000,M=000,H=000,A=00,P=00,PI=2,PO=2\n",
         )
         self.assertEqual(
             lines,
             [
-                "IDENTITY,MEGA_GANTRY_M3",
-                "STATUS,X=0,Y=0,Z=0,SX=0,SY=0,SZ=0,L=000000,M=000,H=000,A=00",
+                "IDENTITY,MEGA_GANTRY_M4",
+                "STATUS,X=0,Y=0,Z=0,SX=0,SY=0,SZ=0,L=000000,M=000,H=000,A=00,P=00,PI=2,PO=2",
             ],
         )
         self.assertEqual(buffer, b"")
 
-    def test_jog_release_uses_immediate_stop(self):
+    def test_jog_release_stops_motion_without_stopping_pumps(self):
         source = (ROOT / "x_control.py").read_text(encoding="utf-8")
         function_source = source.split("    def stop_jog", 1)[1].split(
             "    def on_global_button_release", 1
         )[0]
-        self.assertIn('self.send_command("STOP")', function_source)
+        self.assertIn('self.send_command("MOTION_STOP")', function_source)
+        self.assertNotIn('self.send_command("STOP")', function_source)
         self.assertNotIn('self.send_command("JOG STOP")', function_source)
 
     def test_ui_has_no_acceleration_and_caps_speed_at_five(self):
@@ -126,6 +131,21 @@ class MotionProtocolTests(unittest.TestCase):
         self.assertIn("!yMotionAllowed(axis)", firmware)
         self.assertIn("Y1ALARM", ui)
         self.assertIn("Y2ALARM", ui)
+
+    def test_milestone_four_uses_independent_pump_timers(self):
+        firmware = (
+            ROOT / "mega_x_controller" / "mega_x_controller.ino"
+        ).read_text(encoding="utf-8")
+        ui = (ROOT / "x_control.py").read_text(encoding="utf-8")
+        self.assertIn("PUMP_IN_STEP = 30", firmware)
+        self.assertIn("PUMP_OUT_STEP = 32", firmware)
+        self.assertIn("ISR(TIMER3_COMPA_vect)", firmware)
+        self.assertIn("ISR(TIMER4_COMPA_vect)", firmware)
+        self.assertIn("digitalWrite(pumps[pumpId].dirPin, LOW)", firmware)
+        self.assertIn("stopAllPumps();", firmware)
+        self.assertIn('strcmp(verb, "MOTION_STOP")', firmware)
+        self.assertIn('self.send_command("PUMP START {}".format(pump_id))', ui)
+        self.assertIn('self.send_command("PUMP STOP {}".format(pump_id))', ui)
 
     def test_python_sources_parse_on_python_37_grammar(self):
         for relative_path in ("x_control.py", "tests/test_motion_protocol.py"):

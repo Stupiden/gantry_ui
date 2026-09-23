@@ -1,4 +1,4 @@
-"""Milestone 3: XYZ motion, coordinates, and dual-Y alarm safety."""
+"""Milestone 4: XYZ motion, safety, coordinates, and dual-pump control."""
 
 import sys
 import time
@@ -10,8 +10,9 @@ import serial.tools.list_ports
 
 
 BAUD_RATE = 115200
-CONTROLLER_ID = "MEGA_GANTRY_M3"
+CONTROLLER_ID = "MEGA_GANTRY_M4"
 DEFAULT_SPEED_MM_S = 2.0
+DEFAULT_PUMP_RPM = 2.0
 SERIAL_POLL_MS = 20
 PORT_REFRESH_MS = 1500
 KEEPALIVE_MS = 250
@@ -64,7 +65,15 @@ def parse_status_line(line):
     values["Y1ALARM"] = packed_alarms[0]
     values["Y2ALARM"] = packed_alarms[1]
 
-    for key in ("X", "Y", "Z", "SX", "SY", "SZ"):
+    packed_pumps = values.get("P")
+    if packed_pumps is None or len(packed_pumps) != 2:
+        raise ValueError("invalid packed pump field")
+    if any(state not in "01" for state in packed_pumps):
+        raise ValueError("invalid packed pump state")
+    values["PUMP0RUNNING"] = packed_pumps[0]
+    values["PUMP1RUNNING"] = packed_pumps[1]
+
+    for key in ("X", "Y", "Z", "SX", "SY", "SZ", "PI", "PO"):
         float(values[key])
     return values
 
@@ -90,9 +99,10 @@ class GantryMotionUI(tk.Tk):
 
     def __init__(self):
         tk.Tk.__init__(self)
-        self.title("Gantry Motion Control — Milestone 3")
-        self.geometry("900x840")
-        self.minsize(800, 760)
+        self.title("Gantry Motion Control — Milestone 4")
+        self.geometry("900x800")
+        self.minsize(800, 720)
+        self.option_add("*Font", ("Segoe UI", 9))
 
         self.serial_port = None
         self.controller_ready = False
@@ -119,6 +129,14 @@ class GantryMotionUI(tk.Tk):
         self.homed_vars = {
             axis: tk.StringVar(value="NOT HOMED") for axis in self.AXES
         }
+        self.pump_speed_vars = [
+            tk.DoubleVar(value=DEFAULT_PUMP_RPM),
+            tk.DoubleVar(value=DEFAULT_PUMP_RPM),
+        ]
+        self.pump_status_vars = [
+            tk.StringVar(value="STOPPED"),
+            tk.StringVar(value="STOPPED"),
+        ]
         self.limit_vars = {
             name: tk.StringVar(value="SAFE") for name in self.LIMITS
         }
@@ -146,11 +164,11 @@ class GantryMotionUI(tk.Tk):
             self,
             text="XYZ POSITION / MOTION",
             anchor="center",
-            font=("Segoe UI", 20, "bold"),
+            font=("Segoe UI", 16, "bold"),
         )
-        title.grid(row=0, column=0, sticky="ew", padx=16, pady=(14, 8))
+        title.grid(row=0, column=0, sticky="ew", padx=12, pady=(8, 4))
 
-        body = ttk.Frame(self, padding=(16, 8, 16, 16))
+        body = ttk.Frame(self, padding=(12, 4, 12, 10))
         body.grid(row=1, column=0, sticky="nsew")
         body.columnconfigure(0, weight=1)
 
@@ -160,12 +178,13 @@ class GantryMotionUI(tk.Tk):
         self.build_home_panel(body)
         self.build_relative_move_panel(body)
         self.build_limit_panel(body)
+        self.build_pump_panel(body)
         self.build_alarm_panel(body)
         self.build_stop_panel(body)
 
     def build_connection_panel(self, parent):
-        frame = ttk.LabelFrame(parent, text="Arduino Mega connection", padding=10)
-        frame.grid(row=0, column=0, sticky="ew", pady=(0, 8))
+        frame = ttk.LabelFrame(parent, text="Arduino Mega connection", padding=6)
+        frame.grid(row=0, column=0, sticky="ew", pady=(0, 4))
         frame.columnconfigure(1, weight=1)
 
         ttk.Label(frame, text="Serial port:").grid(row=0, column=0, padx=(0, 8))
@@ -191,8 +210,8 @@ class GantryMotionUI(tk.Tk):
         self.connection_label.grid(row=0, column=4, padx=(12, 0))
 
     def build_position_panel(self, parent):
-        frame = ttk.LabelFrame(parent, text="Coordinate system", padding=10)
-        frame.grid(row=1, column=0, sticky="ew", pady=8)
+        frame = ttk.LabelFrame(parent, text="Coordinate system", padding=6)
+        frame.grid(row=1, column=0, sticky="ew", pady=4)
         frame.columnconfigure(0, weight=0)
         for column in range(1, 4):
             frame.columnconfigure(column, weight=1)
@@ -206,19 +225,19 @@ class GantryMotionUI(tk.Tk):
 
         for column, axis in enumerate(self.AXES, start=1):
             ttk.Label(
-                frame, text=axis, anchor="center", font=("Segoe UI", 14, "bold")
+                frame, text=axis, anchor="center", font=("Segoe UI", 11, "bold")
             ).grid(row=0, column=column, sticky="ew")
             ttk.Label(
                 frame,
                 textvariable=self.position_vars[axis],
                 anchor="center",
-                font=("Consolas", 18, "bold"),
+                font=("Consolas", 14, "bold"),
             ).grid(row=1, column=column, sticky="ew", pady=(2, 0))
             ttk.Label(
                 frame,
                 textvariable=self.scan_position_vars[axis],
                 anchor="center",
-                font=("Consolas", 16),
+                font=("Consolas", 13),
             ).grid(row=2, column=column, sticky="ew")
             ttk.Label(
                 frame, textvariable=self.homed_vars[axis], anchor="center"
@@ -228,8 +247,8 @@ class GantryMotionUI(tk.Tk):
             ).grid(row=4, column=column, sticky="ew")
 
     def build_jog_panel(self, parent):
-        frame = ttk.LabelFrame(parent, text="Jog — hold to move", padding=10)
-        frame.grid(row=2, column=0, sticky="ew", pady=8)
+        frame = ttk.LabelFrame(parent, text="Jog — hold to move", padding=6)
+        frame.grid(row=2, column=0, sticky="ew", pady=4)
         for column in range(3):
             frame.columnconfigure(column, weight=1)
 
@@ -259,8 +278,8 @@ class GantryMotionUI(tk.Tk):
             self.motion_widgets.extend((minus, plus))
 
     def build_relative_move_panel(self, parent):
-        frame = ttk.LabelFrame(parent, text="Relative move", padding=10)
-        frame.grid(row=4, column=0, sticky="ew", pady=8)
+        frame = ttk.LabelFrame(parent, text="Relative move", padding=6)
+        frame.grid(row=4, column=0, sticky="ew", pady=4)
         frame.columnconfigure(3, weight=1)
 
         ttk.Label(frame, text="Axis:").grid(row=0, column=0, padx=(0, 6))
@@ -307,9 +326,9 @@ class GantryMotionUI(tk.Tk):
 
     def build_home_panel(self, parent):
         frame = ttk.LabelFrame(
-            parent, text="Homing / scan coordinate", padding=10
+            parent, text="Homing / scan coordinate", padding=6
         )
-        frame.grid(row=3, column=0, sticky="ew", pady=8)
+        frame.grid(row=3, column=0, sticky="ew", pady=4)
         for column in range(4):
             frame.columnconfigure(column, weight=1)
 
@@ -331,8 +350,8 @@ class GantryMotionUI(tk.Tk):
         self.motion_widgets.append(scan_zero_button)
 
     def build_limit_panel(self, parent):
-        frame = ttk.LabelFrame(parent, text="Limit switches", padding=10)
-        frame.grid(row=5, column=0, sticky="ew", pady=8)
+        frame = ttk.LabelFrame(parent, text="Limit switches", padding=6)
+        frame.grid(row=5, column=0, sticky="ew", pady=4)
         for column in range(6):
             frame.columnconfigure(column, weight=1)
 
@@ -349,16 +368,16 @@ class GantryMotionUI(tk.Tk):
                 frame,
                 text="{} SAFE".format(display_name),
                 fg="#187a2f",
-                font=("Segoe UI", 10, "bold"),
+                font=("Segoe UI", 9, "bold"),
                 padx=5,
-                pady=8,
+                pady=4,
             )
             label.grid(row=0, column=column, sticky="ew")
             self.limit_labels[key] = (label, display_name)
 
     def build_stop_panel(self, parent):
         frame = ttk.Frame(parent)
-        frame.grid(row=7, column=0, sticky="ew", pady=(10, 0))
+        frame.grid(row=8, column=0, sticky="ew", pady=(5, 0))
         frame.columnconfigure(0, weight=1)
 
         self.stop_button = tk.Button(
@@ -369,19 +388,19 @@ class GantryMotionUI(tk.Tk):
             fg="white",
             activebackground="#8b0018",
             activeforeground="white",
-            font=("Segoe UI", 18, "bold"),
-            height=2,
+            font=("Segoe UI", 15, "bold"),
+            height=1,
             state=tk.DISABLED,
         )
         self.stop_button.grid(row=0, column=0, sticky="ew")
 
         ttk.Label(frame, textvariable=self.status_var, anchor="w").grid(
-            row=1, column=0, sticky="ew", pady=(8, 0)
+            row=1, column=0, sticky="ew", pady=(4, 0)
         )
 
     def build_alarm_panel(self, parent):
-        frame = ttk.LabelFrame(parent, text="Y driver alarms", padding=10)
-        frame.grid(row=6, column=0, sticky="ew", pady=8)
+        frame = ttk.LabelFrame(parent, text="Y driver alarms", padding=6)
+        frame.grid(row=7, column=0, sticky="ew", pady=4)
         for column in range(2):
             frame.columnconfigure(column, weight=1)
 
@@ -391,12 +410,63 @@ class GantryMotionUI(tk.Tk):
                 frame,
                 text="{} NORMAL".format(display_name),
                 fg="#187a2f",
-                font=("Segoe UI", 11, "bold"),
+                font=("Segoe UI", 9, "bold"),
                 padx=5,
-                pady=8,
+                pady=4,
             )
             label.grid(row=0, column=column, sticky="ew")
             self.alarm_labels[key] = (label, display_name)
+
+    def build_pump_panel(self, parent):
+        frame = ttk.LabelFrame(parent, text="Peristaltic pumps — clockwise", padding=6)
+        frame.grid(row=6, column=0, sticky="ew", pady=4)
+        for column in range(2):
+            frame.columnconfigure(column, weight=1)
+
+        for pump_id, name in enumerate(("Pump IN", "Pump OUT")):
+            pump_frame = ttk.Frame(frame)
+            pump_frame.grid(row=0, column=pump_id, sticky="ew", padx=6)
+            pump_frame.columnconfigure(1, weight=1)
+
+            ttk.Label(
+                pump_frame, text=name, font=("Segoe UI", 9, "bold")
+            ).grid(row=0, column=0, padx=(0, 8))
+            ttk.Label(
+                pump_frame, textvariable=self.pump_status_vars[pump_id]
+            ).grid(row=0, column=1, sticky="w")
+
+            ttk.Label(pump_frame, text="Speed:").grid(row=1, column=0, pady=(8, 0))
+            speed_box = ttk.Spinbox(
+                pump_frame,
+                from_=0.1,
+                to=20.0,
+                increment=0.1,
+                textvariable=self.pump_speed_vars[pump_id],
+                width=8,
+                command=lambda selected=pump_id: self.apply_pump_speed(selected),
+            )
+            speed_box.grid(row=1, column=1, sticky="w", pady=(8, 0))
+            speed_box.bind(
+                "<Return>",
+                lambda event, selected=pump_id: self.apply_pump_speed(selected),
+            )
+            ttk.Label(pump_frame, text="RPM").grid(
+                row=1, column=1, sticky="w", padx=(70, 0), pady=(8, 0)
+            )
+
+            start_button = ttk.Button(
+                pump_frame,
+                text="START",
+                command=lambda selected=pump_id: self.start_pump(selected),
+            )
+            stop_button = ttk.Button(
+                pump_frame,
+                text="STOP",
+                command=lambda selected=pump_id: self.stop_pump(selected),
+            )
+            start_button.grid(row=2, column=0, sticky="ew", pady=(8, 0), padx=(0, 4))
+            stop_button.grid(row=2, column=1, sticky="ew", pady=(8, 0), padx=(4, 0))
+            self.motion_widgets.extend((speed_box, start_button, stop_button))
 
     def refresh_ports(self):
         if self.is_serial_open():
@@ -484,6 +554,8 @@ class GantryMotionUI(tk.Tk):
         self.status_var.set(reason)
         for axis in self.AXES:
             self.moving_vars[axis].set("IDLE")
+        for pump_status in self.pump_status_vars:
+            pump_status.set("STOPPED")
 
     def is_serial_open(self):
         return self.serial_port is not None and self.serial_port.is_open
@@ -556,6 +628,8 @@ class GantryMotionUI(tk.Tk):
                 self.connection_label.configure(fg="#187a2f")
                 self.set_motion_enabled(True)
                 self.apply_speed()
+                self.apply_pump_speed(0)
+                self.apply_pump_speed(1)
                 self.send_command("STATUS")
                 self.status_var.set("Controller ready")
             return
@@ -607,6 +681,12 @@ class GantryMotionUI(tk.Tk):
                 self.update_limit(key, values.get(key, "0") == "1")
             for key in self.ALARMS:
                 self.update_alarm(key, values.get(key, "0") == "1")
+            self.pump_status_vars[0].set(
+                "RUNNING" if values["PUMP0RUNNING"] == "1" else "STOPPED"
+            )
+            self.pump_status_vars[1].set(
+                "RUNNING" if values["PUMP1RUNNING"] == "1" else "STOPPED"
+            )
         except (KeyError, ValueError):
             self.status_var.set("Invalid STATUS: {}".format(line))
 
@@ -652,8 +732,8 @@ class GantryMotionUI(tk.Tk):
     def stop_jog(self, event=None):
         if self.jog_axis is not None:
             # Jog is a hold-to-run control: releasing the mouse must stop now.
-            # Controlled deceleration is reserved for finite relative moves.
-            self.send_command("STOP")
+            # Stop only XYZ; the red STOP remains the global motion+pump stop.
+            self.send_command("MOTION_STOP")
             self.jog_axis = None
 
     def on_global_button_release(self, event):
@@ -684,6 +764,32 @@ class GantryMotionUI(tk.Tk):
 
     def set_scan_zero(self):
         self.send_command("SCAN_ZERO")
+
+    def validated_pump_speed(self, pump_id):
+        try:
+            rpm = float(self.pump_speed_vars[pump_id].get())
+        except (tk.TclError, ValueError, IndexError):
+            self.status_var.set("Pump speed must be a number")
+            return None
+        if not 0.1 <= rpm <= 20.0:
+            self.status_var.set("Pump speed must be between 0.1 and 20.0 RPM")
+            return None
+        return rpm
+
+    def apply_pump_speed(self, pump_id):
+        rpm = self.validated_pump_speed(pump_id)
+        if rpm is not None:
+            self.send_command("PUMP SPEED {} {:.2f}".format(pump_id, rpm))
+
+    def start_pump(self, pump_id):
+        rpm = self.validated_pump_speed(pump_id)
+        if rpm is None:
+            return
+        self.send_command("PUMP SPEED {} {:.2f}".format(pump_id, rpm))
+        self.send_command("PUMP START {}".format(pump_id))
+
+    def stop_pump(self, pump_id):
+        self.send_command("PUMP STOP {}".format(pump_id))
 
     def emergency_stop(self):
         self.send_command("STOP", require_ready=False)

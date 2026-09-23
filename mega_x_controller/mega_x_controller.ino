@@ -1,17 +1,17 @@
 /*
-  Milestone 3: Arduino Mega XYZ motion with dual-Y alarm safety.
+  Milestone 4: Arduino Mega XYZ motion and dual-pump control.
 
   Scope: position reporting, jog, relative move, immediate software STOP,
   six limit inputs, dual-Y synchronized STEP pulses, homing to MINUS limits,
   independent machine/scan coordinates, dual-Y driver alarm interlock,
-  and a serial watchdog.
+  two fixed-direction peristaltic pumps, and a serial watchdog.
 */
 
 #include <Arduino.h>
 #include <stdlib.h>
 #include <string.h>
 
-const char CONTROLLER_ID[] = "MEGA_GANTRY_M3";
+const char CONTROLLER_ID[] = "MEGA_GANTRY_M4";
 
 const uint8_t X_STEP = 2;
 const uint8_t X_DIR = 3;
@@ -29,6 +29,10 @@ const uint8_t Z_MINUS = 25;
 const uint8_t Z_PLUS = 28;
 const uint8_t Y1_ALARM = 37;
 const uint8_t Y2_ALARM = 38;
+const uint8_t PUMP_IN_STEP = 30;
+const uint8_t PUMP_IN_DIR = 31;
+const uint8_t PUMP_OUT_STEP = 32;
+const uint8_t PUMP_OUT_DIR = 33;
 
 const float STEPS_PER_MM = 160.0f;
 const float DEFAULT_SPEED_MM_S = 2.0f;
@@ -41,6 +45,12 @@ const unsigned int DIR_SETUP_US = 20;
 // the driver's minimum STEP pulse width.
 const uint16_t TIMER_HIGH_TICKS = 8;  // 32 us HIGH pulse.
 const unsigned long TIMER_TICKS_PER_SECOND = F_CPU / 64UL;
+const float PUMP_PULSES_PER_REV = 1600.0f;
+const float DEFAULT_PUMP_RPM = 2.0f;
+const float MIN_PUMP_RPM = 0.1f;
+const float MAX_PUMP_RPM = 20.0f;
+const uint16_t PUMP_HIGH_TICKS = 2;  // Timer3/4 /256: 32 us HIGH.
+const unsigned long PUMP_TIMER_TICKS_PER_SECOND = F_CPU / 256UL;
 const unsigned long STATUS_INTERVAL_MS = 100;
 const unsigned long COMMAND_WATCHDOG_MS = 750;
 const size_t COMMAND_BUFFER_SIZE = 96;
@@ -63,9 +73,22 @@ struct AxisState {
   bool homed;
 };
 
+struct PumpState {
+  uint8_t stepPin;
+  uint8_t dirPin;
+  float rpm;
+  volatile bool running;
+  volatile bool pulseHigh;
+  volatile uint16_t periodTicks;
+};
+
 AxisState xAxis = {'X', 0, 0, 0, MODE_IDLE, 0, 0, false};
 AxisState yAxis = {'Y', 0, 0, 0, MODE_IDLE, 0, 0, false};
 AxisState zAxis = {'Z', 0, 0, 0, MODE_IDLE, 0, 0, false};
+PumpState pumps[2] = {
+    {PUMP_IN_STEP, PUMP_IN_DIR, DEFAULT_PUMP_RPM, false, false, 0},
+    {PUMP_OUT_STEP, PUMP_OUT_DIR, DEFAULT_PUMP_RPM, false, false, 0},
+};
 
 float speedMM = DEFAULT_SPEED_MM_S;
 AxisState *volatile activeAxis = NULL;
@@ -78,6 +101,7 @@ char commandBuffer[COMMAND_BUFFER_SIZE];
 size_t commandLength = 0;
 
 uint16_t timerPeriodForSpeed(float speedMMPerSecond);
+uint16_t pumpTimerPeriod(float rpm);
 
 bool limitTriggered(uint8_t pin) {
   return digitalRead(pin) == LOW;
@@ -187,6 +211,80 @@ void stopAll() {
   setStepLevel(xAxis, LOW);
   setStepLevel(yAxis, LOW);
   setStepLevel(zAxis, LOW);
+}
+
+bool anyPumpRunning() {
+  return pumps[0].running || pumps[1].running;
+}
+
+void stopPump(uint8_t pumpId) {
+  if (pumpId > 1) return;
+  noInterrupts();
+  if (pumpId == 0) {
+    TIMSK3 &= ~_BV(OCIE3A);
+    TCCR3B = 0;
+  } else {
+    TIMSK4 &= ~_BV(OCIE4A);
+    TCCR4B = 0;
+  }
+  pumps[pumpId].running = false;
+  pumps[pumpId].pulseHigh = false;
+  interrupts();
+  digitalWrite(pumps[pumpId].stepPin, LOW);
+}
+
+void stopAllPumps() {
+  stopPump(0);
+  stopPump(1);
+}
+
+uint16_t pumpTimerPeriod(float rpm) {
+  float pulsesPerSecond = rpm * PUMP_PULSES_PER_REV / 60.0f;
+  unsigned long ticks = static_cast<unsigned long>(
+      PUMP_TIMER_TICKS_PER_SECOND / pulsesPerSecond + 0.5f);
+  if (ticks <= PUMP_HIGH_TICKS + 1) ticks = PUMP_HIGH_TICKS + 2;
+  if (ticks > 65535UL) ticks = 65535UL;
+  return static_cast<uint16_t>(ticks);
+}
+
+void applyPumpSpeed(uint8_t pumpId, float rpm) {
+  if (pumpId > 1) return;
+  uint16_t ticks = pumpTimerPeriod(rpm);
+  noInterrupts();
+  pumps[pumpId].rpm = rpm;
+  pumps[pumpId].periodTicks = ticks;
+  interrupts();
+}
+
+void startPump(uint8_t pumpId) {
+  if (pumpId > 1) return;
+  stopPump(pumpId);
+  // Verified independent test: the negative direction is clockwise, which
+  // corresponds to DIR LOW for both installed pump drivers.
+  digitalWrite(pumps[pumpId].dirPin, LOW);
+  delayMicroseconds(DIR_SETUP_US);
+
+  noInterrupts();
+  pumps[pumpId].pulseHigh = false;
+  pumps[pumpId].running = true;
+  if (pumpId == 0) {
+    TCNT3 = 0;
+    OCR3A = pumps[0].periodTicks - 1;
+    TIFR3 = _BV(OCF3A);
+    TCCR3A = 0;
+    TCCR3B = _BV(WGM32);
+    TIMSK3 = _BV(OCIE3A);
+    TCCR3B |= _BV(CS32);  // Prescaler 256, 16 us/tick.
+  } else {
+    TCNT4 = 0;
+    OCR4A = pumps[1].periodTicks - 1;
+    TIFR4 = _BV(OCF4A);
+    TCCR4A = 0;
+    TCCR4B = _BV(WGM42);
+    TIMSK4 = _BV(OCIE4A);
+    TCCR4B |= _BV(CS42);  // Prescaler 256, 16 us/tick.
+  }
+  interrupts();
 }
 
 void startTimer(AxisState &axis) {
@@ -319,6 +417,38 @@ ISR(TIMER1_COMPA_vect) {
 
 }
 
+ISR(TIMER3_COMPA_vect) {
+  if (!pumps[0].running) {
+    TIMSK3 &= ~_BV(OCIE3A);
+    return;
+  }
+  if (!pumps[0].pulseHigh) {
+    OCR3A = PUMP_HIGH_TICKS - 1;
+    digitalWrite(PUMP_IN_STEP, HIGH);
+    pumps[0].pulseHigh = true;
+  } else {
+    OCR3A = pumps[0].periodTicks - PUMP_HIGH_TICKS - 1;
+    digitalWrite(PUMP_IN_STEP, LOW);
+    pumps[0].pulseHigh = false;
+  }
+}
+
+ISR(TIMER4_COMPA_vect) {
+  if (!pumps[1].running) {
+    TIMSK4 &= ~_BV(OCIE4A);
+    return;
+  }
+  if (!pumps[1].pulseHigh) {
+    OCR4A = PUMP_HIGH_TICKS - 1;
+    digitalWrite(PUMP_OUT_STEP, HIGH);
+    pumps[1].pulseHigh = true;
+  } else {
+    OCR4A = pumps[1].periodTicks - PUMP_HIGH_TICKS - 1;
+    digitalWrite(PUMP_OUT_STEP, LOW);
+    pumps[1].pulseHigh = false;
+  }
+}
+
 void applySpeed(float newSpeedMM) {
   speedMM = newSpeedMM;
 }
@@ -390,7 +520,14 @@ void sendStatus(bool force) {
   // A order: Y1, Y2. Alarm inputs are active LOW.
   Serial.print(F(",A="));
   Serial.print(alarmTriggered(Y1_ALARM) ? 1 : 0);
-  Serial.println(alarmTriggered(Y2_ALARM) ? 1 : 0);
+  Serial.print(alarmTriggered(Y2_ALARM) ? 1 : 0);
+  Serial.print(F(",P="));
+  Serial.print(pumps[0].running ? 1 : 0);
+  Serial.print(pumps[1].running ? 1 : 0);
+  Serial.print(F(",PI="));
+  Serial.print(pumps[0].rpm, 2);
+  Serial.print(F(",PO="));
+  Serial.println(pumps[1].rpm, 2);
 }
 
 bool parseFloatStrict(const char *token, float &value) {
@@ -419,7 +556,50 @@ void processCommand(char *command) {
   }
   if (strcmp(verb, "STOP") == 0) {
     stopAll();
+    stopAllPumps();
     Serial.println(F("OK,STOP"));
+    sendStatus(true);
+    return;
+  }
+  if (strcmp(verb, "MOTION_STOP") == 0) {
+    stopAll();
+    Serial.println(F("OK,MOTION_STOP"));
+    sendStatus(true);
+    return;
+  }
+  if (strcmp(verb, "PUMP") == 0) {
+    char *action = strtok_r(NULL, " ", &savePointer);
+    char *pumpToken = strtok_r(NULL, " ", &savePointer);
+    if (action == NULL || pumpToken == NULL || pumpToken[1] != '\0' ||
+        (pumpToken[0] != '0' && pumpToken[0] != '1')) {
+      Serial.println(F("ERROR,BAD_PUMP"));
+      return;
+    }
+    uint8_t pumpId = static_cast<uint8_t>(pumpToken[0] - '0');
+    if (strcmp(action, "START") == 0) {
+      startPump(pumpId);
+      Serial.print(F("OK,PUMP_START,"));
+      Serial.println(pumpId);
+    } else if (strcmp(action, "STOP") == 0) {
+      stopPump(pumpId);
+      Serial.print(F("OK,PUMP_STOP,"));
+      Serial.println(pumpId);
+    } else if (strcmp(action, "SPEED") == 0) {
+      float requestedRpm;
+      if (!parseFloatStrict(strtok_r(NULL, " ", &savePointer), requestedRpm) ||
+          requestedRpm < MIN_PUMP_RPM || requestedRpm > MAX_PUMP_RPM) {
+        Serial.println(F("ERROR,BAD_PUMP_SPEED"));
+        return;
+      }
+      applyPumpSpeed(pumpId, requestedRpm);
+      Serial.print(F("OK,PUMP_SPEED,"));
+      Serial.print(pumpId);
+      Serial.print(',');
+      Serial.println(requestedRpm, 2);
+    } else {
+      Serial.println(F("ERROR,BAD_PUMP_ACTION"));
+      return;
+    }
     sendStatus(true);
     return;
   }
@@ -539,6 +719,12 @@ void setup() {
   TCCR1A = 0;
   TCCR1B = 0;
   TIMSK1 = 0;
+  TCCR3A = 0;
+  TCCR3B = 0;
+  TIMSK3 = 0;
+  TCCR4A = 0;
+  TCCR4B = 0;
+  TIMSK4 = 0;
 
   pinMode(X_STEP, OUTPUT);
   pinMode(X_DIR, OUTPUT);
@@ -564,6 +750,17 @@ void setup() {
   // floating input if an external connection is temporarily open.
   pinMode(Y1_ALARM, INPUT_PULLUP);
   pinMode(Y2_ALARM, INPUT_PULLUP);
+  pinMode(PUMP_IN_STEP, OUTPUT);
+  pinMode(PUMP_IN_DIR, OUTPUT);
+  pinMode(PUMP_OUT_STEP, OUTPUT);
+  pinMode(PUMP_OUT_DIR, OUTPUT);
+  digitalWrite(PUMP_IN_STEP, LOW);
+  digitalWrite(PUMP_OUT_STEP, LOW);
+  digitalWrite(PUMP_IN_DIR, LOW);
+  digitalWrite(PUMP_OUT_DIR, LOW);
+
+  applyPumpSpeed(0, DEFAULT_PUMP_RPM);
+  applyPumpSpeed(1, DEFAULT_PUMP_RPM);
 
   applySpeed(DEFAULT_SPEED_MM_S);
   lastCommandMillis = millis();
@@ -609,8 +806,10 @@ void loop() {
     sendStatus(true);
   }
 
-  if (anyAxisMoving() && millis() - lastCommandMillis > COMMAND_WATCHDOG_MS) {
+  if ((anyAxisMoving() || anyPumpRunning()) &&
+      millis() - lastCommandMillis > COMMAND_WATCHDOG_MS) {
     stopAll();
+    stopAllPumps();
     Serial.println(F("EVENT,WATCHDOG_STOP"));
     sendStatus(true);
   }
