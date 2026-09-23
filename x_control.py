@@ -9,6 +9,8 @@ from tkinter import messagebox, ttk
 import serial
 import serial.tools.list_ports
 
+from gamry_cv_manual import ManualCVWindow
+
 try:
     import toolkitpy as tkp
 except ImportError:
@@ -128,6 +130,7 @@ class GantryMotionUI(tk.Tk):
         self.rx_buffer = b""
         self.gamry_pstat = None
         self.gamry_toolkit_initialized = False
+        self.cv_window = None
 
         self.port_var = tk.StringVar()
         self.connection_var = tk.StringVar(value="● DISCONNECTED")
@@ -257,6 +260,10 @@ class GantryMotionUI(tk.Tk):
             font=("Segoe UI", 9, "bold"),
         )
         self.gamry_status_label.grid(row=1, column=4, padx=(12, 0), pady=(3, 0))
+        self.cv_button = ttk.Button(
+            frame, text="MANUAL CV", command=self.open_cv_window, state="disabled"
+        )
+        self.cv_button.grid(row=1, column=5, padx=(8, 0), pady=(3, 0))
 
     def ensure_gamry_environment(self):
         if tkp is None:
@@ -330,11 +337,15 @@ class GantryMotionUI(tk.Tk):
         self.gamry_connect_button.configure(text="DISCONNECT")
         self.gamry_detect_button.configure(state="disabled")
         self.gamry_device_box.configure(state="disabled")
+        self.cv_button.configure(state="normal")
         self.gamry_status_var.set("● CONNECTED")
         self.gamry_status_label.configure(fg="#187a2f")
         self.status_var.set("Gamry connected: PSTAT")
 
     def disconnect_gamry(self):
+        if self.cv_window is not None and self.cv_window.running:
+            self.status_var.set("Stop CV before disconnecting Gamry")
+            return
         if self.gamry_pstat is not None:
             try:
                 self.gamry_pstat.set_cell(False)
@@ -348,8 +359,28 @@ class GantryMotionUI(tk.Tk):
         self.gamry_connect_button.configure(text="CONNECT")
         self.gamry_detect_button.configure(state="normal")
         self.gamry_device_box.configure(state="readonly")
+        self.cv_button.configure(state="disabled")
         self.gamry_status_var.set("● DISCONNECTED")
         self.gamry_status_label.configure(fg="#666666")
+
+    def current_machine_position(self):
+        positions = []
+        for axis in self.AXES:
+            text = self.position_vars[axis].get().split()[0]
+            positions.append(float(text))
+        return tuple(positions)
+
+    def open_cv_window(self):
+        if self.gamry_pstat is None:
+            self.status_var.set("Connect Gamry before opening manual CV")
+            return
+        if self.cv_window is not None and self.cv_window.winfo_exists():
+            self.cv_window.lift()
+            self.cv_window.focus_force()
+            return
+        self.cv_window = ManualCVWindow(
+            self, self.gamry_pstat, tkp, self.current_machine_position
+        )
 
     def build_position_panel(self, parent):
         frame = ttk.LabelFrame(parent, text="Coordinate system", padding=4)
@@ -1086,11 +1117,15 @@ class GantryMotionUI(tk.Tk):
         self.send_command("LIFT")
 
     def emergency_stop(self):
+        if self.cv_window is not None and self.cv_window.winfo_exists():
+            self.cv_window.stop_cv()
         self.send_command("STOP", require_ready=False)
         self.jog_axis = None
         self.status_var.set("STOP sent")
 
     def on_close(self):
+        if self.cv_window is not None and self.cv_window.winfo_exists():
+            self.cv_window.shutdown()
         if self.gamry_pstat is not None:
             self.disconnect_gamry()
         if self.gamry_toolkit_initialized:

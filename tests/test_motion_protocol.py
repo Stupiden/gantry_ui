@@ -197,8 +197,37 @@ class MotionProtocolTests(unittest.TestCase):
         self.assertNotIn("GamryDtaq", ui)
         self.assertNotIn("Start CV", ui)
 
+    def test_milestone_eight_manual_cv_matches_verified_setup(self):
+        ui = (ROOT / "x_control.py").read_text(encoding="utf-8")
+        cv = (ROOT / "gamry_cv_manual.py").read_text(encoding="utf-8")
+        self.assertIn("ManualCVWindow", ui)
+        self.assertIn("initialize_pstat_for_cv", cv)
+        self.assertIn("signal_r_up_dn_new", cv)
+        self.assertIn("RcvCurve", cv)
+        self.assertIn("self.signal = self.pstat.signal_r_up_dn_new", cv)
+        self.assertIn("CV ended without data", cv)
+        self.assertIn("self.auto_ie_range_var = tk.BooleanVar(value=False)", cv)
+        self.assertIn("self.ie_range_var = tk.DoubleVar(value=10.0)", cv)
+        self.assertIn("self.pstat.set_ie_range_mode(True)", cv)
+        self.assertIn("self.pstat.set_ie_range_mode(False)", cv)
+        self.assertIn('self.pstat.set_ie_range(params["ie_range"])', cv)
+        self.assertIn("set_pos_feed_enable", cv)
+        self.assertIn("set_cell(True)", cv)
+        self.assertIn("set_cell(False)", cv)
+        self.assertIn("curve.stop()", cv)
+        self.assertGreaterEqual(cv.count("tk.DoubleVar(value=0.0)"), 4)
+        self.assertIn('value=0.10', cv)
+        self.assertIn('value=0.001', cv)
+        self.assertIn('value=4', cv)
+        self.assertNotIn("GamryCA", cv)
+        self.assertNotIn("GamryEIS", cv)
+
     def test_python_sources_parse_on_python_37_grammar(self):
-        for relative_path in ("x_control.py", "tests/test_motion_protocol.py"):
+        for relative_path in (
+            "x_control.py",
+            "gamry_cv_manual.py",
+            "tests/test_motion_protocol.py",
+        ):
             source = (ROOT / relative_path).read_text(encoding="utf-8")
             ast.parse(source, filename=relative_path)
 
