@@ -1,4 +1,4 @@
-"""Milestone 1: manual XYZ motion control for the Arduino Mega gantry."""
+"""Milestone 2: XYZ motion, homing, and machine/scan coordinates."""
 
 import sys
 import time
@@ -10,7 +10,7 @@ import serial.tools.list_ports
 
 
 BAUD_RATE = 115200
-CONTROLLER_ID = "MEGA_GANTRY_M1"
+CONTROLLER_ID = "MEGA_GANTRY_M2"
 DEFAULT_SPEED_MM_S = 2.0
 SERIAL_POLL_MS = 20
 PORT_REFRESH_MS = 1500
@@ -21,7 +21,7 @@ MAX_RX_BUFFER_BYTES = 4096
 
 
 def parse_status_line(line):
-    """Parse and expand one compact Milestone-1 STATUS line."""
+    """Parse and expand one compact Milestone-2 STATUS line."""
     if not line.startswith("STATUS,"):
         raise ValueError("not a STATUS line")
 
@@ -48,8 +48,16 @@ def parse_status_line(line):
     for axis, state in zip(("X", "Y", "Z"), packed_motion):
         values["{}MOVING".format(axis)] = state
 
-    for axis in ("X", "Y", "Z"):
-        float(values[axis])
+    packed_homed = values.get("H")
+    if packed_homed is None or len(packed_homed) != 3:
+        raise ValueError("invalid packed homed field")
+    if any(state not in "01" for state in packed_homed):
+        raise ValueError("invalid packed homed state")
+    for axis, state in zip(("X", "Y", "Z"), packed_homed):
+        values["{}HOMED".format(axis)] = state
+
+    for key in ("X", "Y", "Z", "SX", "SY", "SZ"):
+        float(values[key])
     return values
 
 
@@ -73,9 +81,9 @@ class GantryMotionUI(tk.Tk):
 
     def __init__(self):
         tk.Tk.__init__(self)
-        self.title("Gantry Motion Control — Milestone 1")
-        self.geometry("860x690")
-        self.minsize(760, 620)
+        self.title("Gantry Motion Control — Milestone 2")
+        self.geometry("900x780")
+        self.minsize(800, 700)
 
         self.serial_port = None
         self.controller_ready = False
@@ -95,6 +103,12 @@ class GantryMotionUI(tk.Tk):
         self.distance_var = tk.DoubleVar(value=1.0)
         self.position_vars = {
             axis: tk.StringVar(value="0.000 mm") for axis in self.AXES
+        }
+        self.scan_position_vars = {
+            axis: tk.StringVar(value="0.000 mm") for axis in self.AXES
+        }
+        self.homed_vars = {
+            axis: tk.StringVar(value="NOT HOMED") for axis in self.AXES
         }
         self.limit_vars = {
             name: tk.StringVar(value="SAFE") for name in self.LIMITS
@@ -133,6 +147,7 @@ class GantryMotionUI(tk.Tk):
         self.build_connection_panel(body)
         self.build_position_panel(body)
         self.build_jog_panel(body)
+        self.build_home_panel(body)
         self.build_relative_move_panel(body)
         self.build_limit_panel(body)
         self.build_stop_panel(body)
@@ -165,12 +180,20 @@ class GantryMotionUI(tk.Tk):
         self.connection_label.grid(row=0, column=4, padx=(12, 0))
 
     def build_position_panel(self, parent):
-        frame = ttk.LabelFrame(parent, text="Session position", padding=10)
+        frame = ttk.LabelFrame(parent, text="Coordinate system", padding=10)
         frame.grid(row=1, column=0, sticky="ew", pady=8)
-        for column in range(3):
+        frame.columnconfigure(0, weight=0)
+        for column in range(1, 4):
             frame.columnconfigure(column, weight=1)
 
-        for column, axis in enumerate(self.AXES):
+        ttk.Label(frame, text="Machine", font=("Segoe UI", 10, "bold")).grid(
+            row=1, column=0, sticky="w", padx=(0, 12)
+        )
+        ttk.Label(frame, text="Scan", font=("Segoe UI", 10, "bold")).grid(
+            row=2, column=0, sticky="w", padx=(0, 12)
+        )
+
+        for column, axis in enumerate(self.AXES, start=1):
             ttk.Label(
                 frame, text=axis, anchor="center", font=("Segoe UI", 14, "bold")
             ).grid(row=0, column=column, sticky="ew")
@@ -178,11 +201,20 @@ class GantryMotionUI(tk.Tk):
                 frame,
                 textvariable=self.position_vars[axis],
                 anchor="center",
-                font=("Consolas", 24, "bold"),
+                font=("Consolas", 18, "bold"),
             ).grid(row=1, column=column, sticky="ew", pady=(2, 0))
             ttk.Label(
-                frame, textvariable=self.moving_vars[axis], anchor="center"
+                frame,
+                textvariable=self.scan_position_vars[axis],
+                anchor="center",
+                font=("Consolas", 16),
             ).grid(row=2, column=column, sticky="ew")
+            ttk.Label(
+                frame, textvariable=self.homed_vars[axis], anchor="center"
+            ).grid(row=3, column=column, sticky="ew", pady=(3, 0))
+            ttk.Label(
+                frame, textvariable=self.moving_vars[axis], anchor="center"
+            ).grid(row=4, column=column, sticky="ew")
 
     def build_jog_panel(self, parent):
         frame = ttk.LabelFrame(parent, text="Jog — hold to move", padding=10)
@@ -217,7 +249,7 @@ class GantryMotionUI(tk.Tk):
 
     def build_relative_move_panel(self, parent):
         frame = ttk.LabelFrame(parent, text="Relative move", padding=10)
-        frame.grid(row=3, column=0, sticky="ew", pady=8)
+        frame.grid(row=4, column=0, sticky="ew", pady=8)
         frame.columnconfigure(3, weight=1)
 
         ttk.Label(frame, text="Axis:").grid(row=0, column=0, padx=(0, 6))
@@ -262,9 +294,34 @@ class GantryMotionUI(tk.Tk):
 
         self.motion_widgets.extend((axis_box, distance_box, move_button, speed_box))
 
+    def build_home_panel(self, parent):
+        frame = ttk.LabelFrame(
+            parent, text="Homing / scan coordinate", padding=10
+        )
+        frame.grid(row=3, column=0, sticky="ew", pady=8)
+        for column in range(4):
+            frame.columnconfigure(column, weight=1)
+
+        for column, axis in enumerate(self.AXES):
+            button = ttk.Button(
+                frame,
+                text="HOME {}".format(axis),
+                command=lambda selected_axis=axis: self.home_axis(selected_axis),
+            )
+            button.grid(row=0, column=column, sticky="ew", padx=4)
+            self.motion_widgets.append(button)
+
+        scan_zero_button = ttk.Button(
+            frame,
+            text="SET CURRENT AS SCAN ZERO",
+            command=self.set_scan_zero,
+        )
+        scan_zero_button.grid(row=0, column=3, sticky="ew", padx=4)
+        self.motion_widgets.append(scan_zero_button)
+
     def build_limit_panel(self, parent):
         frame = ttk.LabelFrame(parent, text="Limit switches", padding=10)
-        frame.grid(row=4, column=0, sticky="ew", pady=8)
+        frame.grid(row=5, column=0, sticky="ew", pady=8)
         for column in range(6):
             frame.columnconfigure(column, weight=1)
 
@@ -290,7 +347,7 @@ class GantryMotionUI(tk.Tk):
 
     def build_stop_panel(self, parent):
         frame = ttk.Frame(parent)
-        frame.grid(row=5, column=0, sticky="ew", pady=(10, 0))
+        frame.grid(row=6, column=0, sticky="ew", pady=(10, 0))
         frame.columnconfigure(0, weight=1)
 
         self.stop_button = tk.Button(
@@ -491,11 +548,21 @@ class GantryMotionUI(tk.Tk):
             values = parse_status_line(line)
 
             for axis in self.AXES:
-                if axis in values:
-                    position = float(values[axis])
-                    if abs(position) < 0.0005:
-                        position = 0.0
-                    self.position_vars[axis].set("{:.3f} mm".format(position))
+                machine_position = float(values[axis])
+                scan_position = float(values["S{}".format(axis)])
+                if abs(machine_position) < 0.0005:
+                    machine_position = 0.0
+                if abs(scan_position) < 0.0005:
+                    scan_position = 0.0
+                self.position_vars[axis].set(
+                    "{:.3f} mm".format(machine_position)
+                )
+                self.scan_position_vars[axis].set(
+                    "{:.3f} mm".format(scan_position)
+                )
+                self.homed_vars[axis].set(
+                    "HOMED" if values["{}HOMED".format(axis)] == "1" else "NOT HOMED"
+                )
                 moving_key = "{}MOVING".format(axis)
                 self.moving_vars[axis].set(
                     "MOVING" if values.get(moving_key, "0") == "1" else "IDLE"
@@ -565,6 +632,14 @@ class GantryMotionUI(tk.Tk):
             return
         self.send_command("SPEED {:.3f}".format(speed))
         self.send_command("MOVE {} {:.3f}".format(axis, distance))
+
+    def home_axis(self, axis):
+        if axis in self.AXES:
+            self.jog_axis = None
+            self.send_command("HOME {}".format(axis))
+
+    def set_scan_zero(self):
+        self.send_command("SCAN_ZERO")
 
     def emergency_stop(self):
         self.send_command("STOP", require_ready=False)

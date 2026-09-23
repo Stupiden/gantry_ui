@@ -1,16 +1,16 @@
 /*
-  Milestone 1: Arduino Mega XYZ manual-motion foundation.
+  Milestone 2: Arduino Mega XYZ homing and coordinate foundation.
 
   Scope: position reporting, jog, relative move, immediate software STOP,
-  six limit inputs, dual-Y synchronized STEP pulses, and a serial watchdog.
-  Position is open-loop session position; homing is intentionally not included.
+  six limit inputs, dual-Y synchronized STEP pulses, homing to MINUS limits,
+  independent machine/scan coordinates, and a serial watchdog.
 */
 
 #include <Arduino.h>
 #include <stdlib.h>
 #include <string.h>
 
-const char CONTROLLER_ID[] = "MEGA_GANTRY_M1";
+const char CONTROLLER_ID[] = "MEGA_GANTRY_M2";
 
 const uint8_t X_STEP = 2;
 const uint8_t X_DIR = 3;
@@ -29,6 +29,7 @@ const uint8_t Z_PLUS = 28;
 
 const float STEPS_PER_MM = 160.0f;
 const float DEFAULT_SPEED_MM_S = 2.0f;
+const float HOME_SPEED_MM_S = 1.0f;
 const float MIN_SPEED_MM_S = 0.05f;
 const float MAX_SPEED_MM_S = 5.0f;
 const unsigned int DIR_SETUP_US = 20;
@@ -44,7 +45,8 @@ const size_t COMMAND_BUFFER_SIZE = 96;
 enum MotionMode {
   MODE_IDLE,
   MODE_JOG,
-  MODE_MOVE
+  MODE_MOVE,
+  MODE_HOME
 };
 
 struct AxisState {
@@ -54,11 +56,13 @@ struct AxisState {
   int8_t direction;
   MotionMode mode;
   uint16_t periodTicks;
+  long scanZeroSteps;
+  bool homed;
 };
 
-AxisState xAxis = {'X', 0, 0, 0, MODE_IDLE, 0};
-AxisState yAxis = {'Y', 0, 0, 0, MODE_IDLE, 0};
-AxisState zAxis = {'Z', 0, 0, 0, MODE_IDLE, 0};
+AxisState xAxis = {'X', 0, 0, 0, MODE_IDLE, 0, 0, false};
+AxisState yAxis = {'Y', 0, 0, 0, MODE_IDLE, 0, 0, false};
+AxisState zAxis = {'Z', 0, 0, 0, MODE_IDLE, 0, 0, false};
 
 float speedMM = DEFAULT_SPEED_MM_S;
 AxisState *volatile activeAxis = NULL;
@@ -215,6 +219,25 @@ bool startRelativeMove(AxisState &axis, float distanceMM) {
   return true;
 }
 
+bool startHome(AxisState &axis) {
+  stopAll();
+
+  // An axis already resting on its MINUS switch is at machine zero.
+  if (!movementAllowed(axis, -1)) {
+    axis.positionSteps = 0;
+    axis.homed = true;
+    return false;
+  }
+
+  axis.direction = -1;
+  axis.periodTicks = timerPeriodForSpeed(HOME_SPEED_MM_S);
+  setAxisDirection(axis, -1);
+  delayMicroseconds(DIR_SETUP_US);
+  axis.mode = MODE_HOME;
+  startTimer(axis);
+  return true;
+}
+
 uint16_t timerPeriodForSpeed(float speedMMPerSecond) {
   float stepsPerSecond = speedMMPerSecond * STEPS_PER_MM;
   unsigned long ticks =
@@ -273,6 +296,26 @@ void printPosition(const AxisState &axis) {
   Serial.print(static_cast<float>(positionSnapshot) / STEPS_PER_MM, 3);
 }
 
+void printScanPosition(const AxisState &axis) {
+  long positionSnapshot;
+  long scanZeroSnapshot;
+  noInterrupts();
+  positionSnapshot = axis.positionSteps;
+  scanZeroSnapshot = axis.scanZeroSteps;
+  interrupts();
+  Serial.print(static_cast<float>(positionSnapshot - scanZeroSnapshot) /
+                   STEPS_PER_MM,
+               3);
+}
+
+void setScanZero() {
+  noInterrupts();
+  xAxis.scanZeroSteps = xAxis.positionSteps;
+  yAxis.scanZeroSteps = yAxis.positionSteps;
+  zAxis.scanZeroSteps = zAxis.positionSteps;
+  interrupts();
+}
+
 void sendStatus(bool force) {
   unsigned long now = millis();
   // Keep the motion path quiet; start/stop/completion/limit events force status.
@@ -286,7 +329,12 @@ void sendStatus(bool force) {
   printPosition(yAxis);
   Serial.print(F(",Z="));
   printPosition(zAxis);
-  // Compact fields keep this periodic line below the Mega serial TX buffer.
+  Serial.print(F(",SX="));
+  printScanPosition(xAxis);
+  Serial.print(F(",SY="));
+  printScanPosition(yAxis);
+  Serial.print(F(",SZ="));
+  printScanPosition(zAxis);
   // L order: X-, X+, Y-, Y+, Z-, Z+. M order: X, Y, Z.
   Serial.print(F(",L="));
   Serial.print(limitTriggered(X_MINUS) ? 1 : 0);
@@ -298,7 +346,12 @@ void sendStatus(bool force) {
   Serial.print(F(",M="));
   Serial.print(axisIsMoving(xAxis) ? 1 : 0);
   Serial.print(axisIsMoving(yAxis) ? 1 : 0);
-  Serial.println(axisIsMoving(zAxis) ? 1 : 0);
+  Serial.print(axisIsMoving(zAxis) ? 1 : 0);
+  // H order: X, Y, Z. Homed remains true through ordinary motion.
+  Serial.print(F(",H="));
+  Serial.print(xAxis.homed ? 1 : 0);
+  Serial.print(yAxis.homed ? 1 : 0);
+  Serial.println(zAxis.homed ? 1 : 0);
 }
 
 bool parseFloatStrict(const char *token, float &value) {
@@ -341,6 +394,32 @@ void processCommand(char *command) {
     applySpeed(requestedSpeed);
     Serial.print(F("OK,SPEED,"));
     Serial.println(speedMM, 3);
+    return;
+  }
+  if (strcmp(verb, "HOME") == 0) {
+    AxisState *axis = axisFromName(strtok_r(NULL, " ", &savePointer));
+    if (axis == NULL) {
+      Serial.println(F("ERROR,BAD_HOME"));
+      return;
+    }
+    bool started = startHome(*axis);
+    if (started) {
+      Serial.print(F("OK,HOMING,"));
+    } else {
+      Serial.print(F("EVENT,HOME_DONE,"));
+    }
+    Serial.println(axis->name);
+    sendStatus(true);
+    return;
+  }
+  if (strcmp(verb, "SCAN_ZERO") == 0) {
+    if (anyAxisMoving()) {
+      Serial.println(F("ERROR,MOVING"));
+      return;
+    }
+    setScanZero();
+    Serial.println(F("OK,SCAN_ZERO"));
+    sendStatus(true);
     return;
   }
   if (strcmp(verb, "JOG") == 0) {
@@ -451,12 +530,20 @@ void loop() {
   AxisState *axis = activeAxis;
   if (axis != NULL && !movementAllowed(*axis, axis->direction)) {
     char axisName = axis->name;
+    MotionMode stoppedMode = axis->mode;
     const char *limitName = activeLimitName(*axis, axis->direction);
     stopAll();
-    Serial.print(F("EVENT,LIMIT_STOP,"));
-    Serial.print(axisName);
-    Serial.print(',');
-    Serial.println(limitName);
+    if (stoppedMode == MODE_HOME) {
+      axis->positionSteps = 0;
+      axis->homed = true;
+      Serial.print(F("EVENT,HOME_DONE,"));
+      Serial.println(axisName);
+    } else {
+      Serial.print(F("EVENT,LIMIT_STOP,"));
+      Serial.print(axisName);
+      Serial.print(',');
+      Serial.println(limitName);
+    }
     sendStatus(true);
   }
 
