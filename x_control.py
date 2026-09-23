@@ -16,6 +16,8 @@ SERIAL_POLL_MS = 20
 PORT_REFRESH_MS = 1500
 KEEPALIVE_MS = 250
 HANDSHAKE_RETRY_MS = 500
+CONTROLLER_BOOT_WAIT_MS = 2000
+MAX_RX_BUFFER_BYTES = 4096
 
 
 def parse_status_line(line):
@@ -51,6 +53,20 @@ def parse_status_line(line):
     return values
 
 
+def extract_complete_lines(buffer, chunk):
+    """Return complete newline-terminated ASCII lines and the remainder."""
+    buffer += chunk
+    lines = []
+    while b"\n" in buffer:
+        raw_line, buffer = buffer.split(b"\n", 1)
+        line = raw_line.rstrip(b"\r").decode("ascii", errors="replace").strip()
+        if line:
+            lines.append(line)
+    if len(buffer) > MAX_RX_BUFFER_BYTES:
+        buffer = b""
+    return lines, buffer
+
+
 class GantryMotionUI(tk.Tk):
     AXES = ("X", "Y", "Z")
     LIMITS = ("XMIN", "XPLUS", "YMIN", "YPLUS", "ZMIN", "ZPLUS")
@@ -65,8 +81,11 @@ class GantryMotionUI(tk.Tk):
         self.controller_ready = False
         self.jog_axis = None
         self.last_handshake_attempt = 0.0
+        self.serial_opened_at = 0.0
+        self.handshake_started = False
         self.last_keepalive = 0.0
         self.last_ports = []
+        self.rx_buffer = b""
 
         self.port_var = tk.StringVar()
         self.connection_var = tk.StringVar(value="● DISCONNECTED")
@@ -230,7 +249,7 @@ class GantryMotionUI(tk.Tk):
         speed_box = ttk.Spinbox(
             frame,
             from_=0.05,
-            to=20.0,
+            to=5.0,
             increment=0.05,
             textvariable=self.speed_var,
             width=9,
@@ -340,7 +359,10 @@ class GantryMotionUI(tk.Tk):
 
         self.controller_ready = False
         self.jog_axis = None
+        self.rx_buffer = b""
         self.last_handshake_attempt = 0.0
+        self.serial_opened_at = time.monotonic()
+        self.handshake_started = False
         self.connect_button.configure(text="DISCONNECT")
         self.port_box.configure(state="disabled")
         self.refresh_button.configure(state="disabled")
@@ -362,6 +384,9 @@ class GantryMotionUI(tk.Tk):
         self.serial_port = None
         self.controller_ready = False
         self.jog_axis = None
+        self.rx_buffer = b""
+        self.serial_opened_at = 0.0
+        self.handshake_started = False
         self.set_motion_enabled(False)
         self.stop_button.configure(state=tk.DISABLED)
         self.connect_button.configure(text="CONNECT")
@@ -401,18 +426,30 @@ class GantryMotionUI(tk.Tk):
     def service_serial(self):
         if self.is_serial_open():
             try:
-                while self.serial_port.in_waiting:
-                    line = self.serial_port.readline().decode(
-                        "ascii", errors="replace"
-                    ).strip()
-                    if line:
+                waiting = self.serial_port.in_waiting
+                if waiting:
+                    chunk = self.serial_port.read(waiting)
+                    lines, self.rx_buffer = extract_complete_lines(
+                        self.rx_buffer, chunk
+                    )
+                    for line in lines:
                         self.handle_serial_line(line)
             except (OSError, serial.SerialException) as error:
                 self.disconnect_serial("Serial read failed: {}".format(error))
 
         now = time.monotonic()
         if self.is_serial_open() and not self.controller_ready:
-            if (now - self.last_handshake_attempt) * 1000.0 >= HANDSHAKE_RETRY_MS:
+            boot_wait_finished = (
+                (now - self.serial_opened_at) * 1000.0 >= CONTROLLER_BOOT_WAIT_MS
+            )
+            if boot_wait_finished and not self.handshake_started:
+                self.serial_port.reset_input_buffer()
+                self.rx_buffer = b""
+                self.handshake_started = True
+                self.last_handshake_attempt = 0.0
+            if self.handshake_started and (
+                (now - self.last_handshake_attempt) * 1000.0 >= HANDSHAKE_RETRY_MS
+            ):
                 self.last_handshake_attempt = now
                 self.send_command("HELLO", require_ready=False)
         elif self.controller_ready:
@@ -482,8 +519,8 @@ class GantryMotionUI(tk.Tk):
         except (tk.TclError, ValueError):
             self.status_var.set("Speed must be a number")
             return None
-        if not 0.05 <= speed <= 20.0:
-            self.status_var.set("Speed must be between 0.05 and 20.0 mm/s")
+        if not 0.05 <= speed <= 5.0:
+            self.status_var.set("Speed must be between 0.05 and 5.0 mm/s")
             return None
         return speed
 
@@ -503,6 +540,8 @@ class GantryMotionUI(tk.Tk):
 
     def stop_jog(self, event=None):
         if self.jog_axis is not None:
+            # Jog is a hold-to-run control: releasing the mouse must stop now.
+            # Controlled deceleration is reserved for finite relative moves.
             self.send_command("STOP")
             self.jog_axis = None
 

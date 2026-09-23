@@ -7,7 +7,6 @@
 */
 
 #include <Arduino.h>
-#include <math.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -31,9 +30,13 @@ const uint8_t Z_PLUS = 28;
 const float STEPS_PER_MM = 160.0f;
 const float DEFAULT_SPEED_MM_S = 2.0f;
 const float MIN_SPEED_MM_S = 0.05f;
-const float MAX_SPEED_MM_S = 20.0f;
-const unsigned int STEP_PULSE_US = 5;
-const unsigned int DIR_SETUP_US = 10;
+const float MAX_SPEED_MM_S = 5.0f;
+const unsigned int DIR_SETUP_US = 20;
+// Timer1 /64 gives 4 us/tick.  Eight ticks leave enough margin for AVR ISR
+// entry and digitalWrite() before the next compare, while remaining far above
+// the driver's minimum STEP pulse width.
+const uint16_t TIMER_HIGH_TICKS = 8;  // 32 us HIGH pulse.
+const unsigned long TIMER_TICKS_PER_SECOND = F_CPU / 64UL;
 const unsigned long STATUS_INTERVAL_MS = 100;
 const unsigned long COMMAND_WATCHDOG_MS = 750;
 const size_t COMMAND_BUFFER_SIZE = 96;
@@ -50,7 +53,7 @@ struct AxisState {
   unsigned long remainingSteps;
   int8_t direction;
   MotionMode mode;
-  unsigned long nextStepMicros;
+  uint16_t periodTicks;
 };
 
 AxisState xAxis = {'X', 0, 0, 0, MODE_IDLE, 0};
@@ -58,11 +61,16 @@ AxisState yAxis = {'Y', 0, 0, 0, MODE_IDLE, 0};
 AxisState zAxis = {'Z', 0, 0, 0, MODE_IDLE, 0};
 
 float speedMM = DEFAULT_SPEED_MM_S;
-unsigned long stepIntervalMicros = 3125;
+AxisState *volatile activeAxis = NULL;
+volatile bool timerPulseHigh = false;
+volatile bool motionCompleted = false;
+volatile char completedAxisName = 0;
 unsigned long lastStatusMillis = 0;
 unsigned long lastCommandMillis = 0;
 char commandBuffer[COMMAND_BUFFER_SIZE];
 size_t commandLength = 0;
+
+uint16_t timerPeriodForSpeed(float speedMMPerSecond);
 
 bool limitTriggered(uint8_t pin) {
   return digitalRead(pin) == LOW;
@@ -101,7 +109,7 @@ const char *activeLimitName(const AxisState &axis, int8_t direction) {
 }
 
 void setAxisDirection(const AxisState &axis, int8_t direction) {
-  // Confirmed convention: X+ LOW, Y+ HIGH, Z+ downward LOW.
+  // Confirmed convention: X+ LOW, Y+ HIGH, Z+ is downward.
   if (axis.name == 'X') {
     digitalWrite(X_DIR, direction > 0 ? LOW : HIGH);
   } else if (axis.name == 'Y') {
@@ -109,42 +117,59 @@ void setAxisDirection(const AxisState &axis, int8_t direction) {
     digitalWrite(Y1_DIR, level);
     digitalWrite(Y2_DIR, level);
   } else {
+    // Machine convention: Z+ is downward.  This drive needs LOW for Z+.
     digitalWrite(Z_DIR, direction > 0 ? LOW : HIGH);
   }
 }
 
-void pulseAxis(const AxisState &axis) {
+void setStepLevel(const AxisState &axis, uint8_t level) {
   if (axis.name == 'X') {
-    digitalWrite(X_STEP, HIGH);
-    delayMicroseconds(STEP_PULSE_US);
-    digitalWrite(X_STEP, LOW);
+    digitalWrite(X_STEP, level);
   } else if (axis.name == 'Y') {
-    digitalWrite(Y1_STEP, HIGH);
-    digitalWrite(Y2_STEP, HIGH);
-    delayMicroseconds(STEP_PULSE_US);
-    digitalWrite(Y1_STEP, LOW);
-    digitalWrite(Y2_STEP, LOW);
+    digitalWrite(Y1_STEP, level);
+    digitalWrite(Y2_STEP, level);
   } else {
-    digitalWrite(Z_STEP, HIGH);
-    delayMicroseconds(STEP_PULSE_US);
-    digitalWrite(Z_STEP, LOW);
+    digitalWrite(Z_STEP, level);
   }
 }
 
-void stopAxis(AxisState &axis) {
-  axis.mode = MODE_IDLE;
-  axis.remainingSteps = 0;
-  axis.direction = 0;
+void stopTimer() {
+  TIMSK1 &= ~_BV(OCIE1A);
+  TCCR1B = 0;
+  timerPulseHigh = false;
 }
 
 void stopAll() {
-  stopAxis(xAxis);
-  stopAxis(yAxis);
-  stopAxis(zAxis);
-  digitalWrite(X_STEP, LOW);
-  digitalWrite(Y1_STEP, LOW);
-  digitalWrite(Y2_STEP, LOW);
-  digitalWrite(Z_STEP, LOW);
+  noInterrupts();
+  stopTimer();
+  activeAxis = NULL;
+  xAxis.mode = MODE_IDLE;
+  yAxis.mode = MODE_IDLE;
+  zAxis.mode = MODE_IDLE;
+  xAxis.remainingSteps = 0;
+  yAxis.remainingSteps = 0;
+  zAxis.remainingSteps = 0;
+  xAxis.direction = 0;
+  yAxis.direction = 0;
+  zAxis.direction = 0;
+  interrupts();
+  setStepLevel(xAxis, LOW);
+  setStepLevel(yAxis, LOW);
+  setStepLevel(zAxis, LOW);
+}
+
+void startTimer(AxisState &axis) {
+  noInterrupts();
+  activeAxis = &axis;
+  timerPulseHigh = false;
+  TCNT1 = 0;
+  OCR1A = axis.periodTicks - 1;
+  TIFR1 = _BV(OCF1A);
+  TCCR1A = 0;
+  TCCR1B = _BV(WGM12);
+  TIMSK1 = _BV(OCIE1A);
+  TCCR1B |= _BV(CS11) | _BV(CS10);  // Prescaler 64, 4 us/tick.
+  interrupts();
 }
 
 bool startJog(AxisState &axis, int8_t direction) {
@@ -157,9 +182,11 @@ bool startJog(AxisState &axis, int8_t direction) {
   }
   stopAll();
   axis.direction = direction;
+  axis.periodTicks = timerPeriodForSpeed(speedMM);
   setAxisDirection(axis, direction);
-  axis.nextStepMicros = micros() + DIR_SETUP_US;
+  delayMicroseconds(DIR_SETUP_US);
   axis.mode = MODE_JOG;
+  startTimer(axis);
   return true;
 }
 
@@ -180,53 +207,76 @@ bool startRelativeMove(AxisState &axis, float distanceMM) {
   stopAll();
   axis.direction = direction;
   axis.remainingSteps = static_cast<unsigned long>(labs(signedSteps));
+  axis.periodTicks = timerPeriodForSpeed(speedMM);
   setAxisDirection(axis, direction);
-  axis.nextStepMicros = micros() + DIR_SETUP_US;
+  delayMicroseconds(DIR_SETUP_US);
   axis.mode = MODE_MOVE;
+  startTimer(axis);
   return true;
 }
 
-void updateAxis(AxisState &axis) {
-  if (axis.mode == MODE_IDLE) return;
+uint16_t timerPeriodForSpeed(float speedMMPerSecond) {
+  float stepsPerSecond = speedMMPerSecond * STEPS_PER_MM;
+  unsigned long ticks =
+      static_cast<unsigned long>(TIMER_TICKS_PER_SECOND / stepsPerSecond + 0.5f);
+  if (ticks <= TIMER_HIGH_TICKS + 1) ticks = TIMER_HIGH_TICKS + 2;
+  if (ticks > 65535UL) ticks = 65535UL;
+  return static_cast<uint16_t>(ticks);
+}
 
-  if (!movementAllowed(axis, axis.direction)) {
-    const char *limitName = activeLimitName(axis, axis.direction);
-    stopAxis(axis);
-    Serial.print(F("EVENT,LIMIT_STOP,"));
-    Serial.print(axis.name);
-    Serial.print(',');
-    Serial.println(limitName);
+ISR(TIMER1_COMPA_vect) {
+  AxisState *axis = activeAxis;
+  if (axis == NULL || axis->mode == MODE_IDLE) {
+    stopTimer();
     return;
   }
 
-  unsigned long now = micros();
-  if (static_cast<long>(now - axis.nextStepMicros) < 0) return;
-
-  pulseAxis(axis);
-  axis.positionSteps += axis.direction;
-  axis.nextStepMicros = now + stepIntervalMicros;
-
-  if (axis.mode == MODE_MOVE) {
-    if (axis.remainingSteps > 0) axis.remainingSteps--;
-    if (axis.remainingSteps == 0) stopAxis(axis);
+  if (!timerPulseHigh) {
+    // Load the short phase before touching the pins.  Loading it afterwards
+    // can miss the compare point because digitalWrite() itself takes time.
+    OCR1A = TIMER_HIGH_TICKS - 1;
+    setStepLevel(*axis, HIGH);
+    timerPulseHigh = true;
+    return;
   }
+
+  OCR1A = axis->periodTicks - TIMER_HIGH_TICKS - 1;
+  setStepLevel(*axis, LOW);
+  timerPulseHigh = false;
+  axis->positionSteps += axis->direction;
+
+  if (axis->mode == MODE_MOVE) {
+    if (axis->remainingSteps > 0) axis->remainingSteps--;
+    if (axis->remainingSteps == 0) {
+      char axisName = axis->name;
+      axis->mode = MODE_IDLE;
+      axis->direction = 0;
+      activeAxis = NULL;
+      stopTimer();
+      completedAxisName = axisName;
+      motionCompleted = true;
+      return;
+    }
+  }
+
 }
 
 void applySpeed(float newSpeedMM) {
   speedMM = newSpeedMM;
-  float stepsPerSecond = speedMM * STEPS_PER_MM;
-  stepIntervalMicros = static_cast<unsigned long>(1000000.0f / stepsPerSecond);
-  if (stepIntervalMicros <= STEP_PULSE_US) {
-    stepIntervalMicros = STEP_PULSE_US + 1;
-  }
 }
 
 void printPosition(const AxisState &axis) {
-  Serial.print(static_cast<float>(axis.positionSteps) / STEPS_PER_MM, 3);
+  long positionSnapshot;
+  noInterrupts();
+  positionSnapshot = axis.positionSteps;
+  interrupts();
+  Serial.print(static_cast<float>(positionSnapshot) / STEPS_PER_MM, 3);
 }
 
 void sendStatus(bool force) {
   unsigned long now = millis();
+  // Keep the motion path quiet; start/stop/completion/limit events force status.
+  if (!force && anyAxisMoving()) return;
   if (!force && now - lastStatusMillis < STATUS_INTERVAL_MS) return;
   lastStatusMillis = now;
 
@@ -294,7 +344,15 @@ void processCommand(char *command) {
     return;
   }
   if (strcmp(verb, "JOG") == 0) {
-    AxisState *axis = axisFromName(strtok_r(NULL, " ", &savePointer));
+    char *axisToken = strtok_r(NULL, " ", &savePointer);
+    // Compatibility and safety: every Jog-stop spelling is a hard stop.
+    if (axisToken != NULL && strcmp(axisToken, "STOP") == 0) {
+      stopAll();
+      Serial.println(F("OK,JOG_STOP"));
+      sendStatus(true);
+      return;
+    }
+    AxisState *axis = axisFromName(axisToken);
     char *directionToken = strtok_r(NULL, " ", &savePointer);
     if (axis == NULL || directionToken == NULL || directionToken[1] != '\0' ||
         (directionToken[0] != '+' && directionToken[0] != '-')) {
@@ -307,6 +365,7 @@ void processCommand(char *command) {
       Serial.print(axis->name);
       Serial.print(',');
       Serial.println(directionToken);
+      sendStatus(true);
     }
     return;
   }
@@ -324,6 +383,7 @@ void processCommand(char *command) {
       Serial.print(axis->name);
       Serial.print(',');
       Serial.println(distanceMM, 3);
+      sendStatus(true);
     }
     return;
   }
@@ -352,6 +412,10 @@ void readSerial() {
 
 void setup() {
   Serial.begin(115200);
+
+  TCCR1A = 0;
+  TCCR1B = 0;
+  TIMSK1 = 0;
 
   pinMode(X_STEP, OUTPUT);
   pinMode(X_DIR, OUTPUT);
@@ -384,14 +448,33 @@ void setup() {
 void loop() {
   readSerial();
 
+  AxisState *axis = activeAxis;
+  if (axis != NULL && !movementAllowed(*axis, axis->direction)) {
+    char axisName = axis->name;
+    const char *limitName = activeLimitName(*axis, axis->direction);
+    stopAll();
+    Serial.print(F("EVENT,LIMIT_STOP,"));
+    Serial.print(axisName);
+    Serial.print(',');
+    Serial.println(limitName);
+    sendStatus(true);
+  }
+
   if (anyAxisMoving() && millis() - lastCommandMillis > COMMAND_WATCHDOG_MS) {
     stopAll();
     Serial.println(F("EVENT,WATCHDOG_STOP"));
     sendStatus(true);
   }
 
-  updateAxis(xAxis);
-  updateAxis(yAxis);
-  updateAxis(zAxis);
+  if (motionCompleted) {
+    noInterrupts();
+    char axisName = completedAxisName;
+    motionCompleted = false;
+    interrupts();
+    Serial.print(F("EVENT,MOVE_DONE,"));
+    Serial.println(axisName);
+    sendStatus(true);
+  }
+
   sendStatus(false);
 }
