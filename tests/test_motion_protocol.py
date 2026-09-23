@@ -29,7 +29,8 @@ class MotionProtocolTests(unittest.TestCase):
     def test_compact_status_expands_positions_limits_and_motion(self):
         values = parse_status_line(
             "STATUS,X=1.250,Y=-2.000,Z=0.006,SX=0.250,SY=-3.000,SZ=0.000,"
-            "L=010101,M=101,H=110,A=01,P=10,PI=2.00,PO=3.50"
+            "L=010101,M=101,H=110,A=01,P=10,PI=2.00,PO=3.50,"
+            "LC=1,T=0,R=1234,FR=1200,F=99.50"
         )
         self.assertEqual(values["X"], "1.250")
         self.assertEqual(values["YMIN"], "0")
@@ -45,11 +46,14 @@ class MotionProtocolTests(unittest.TestCase):
         self.assertEqual(values["PUMP0RUNNING"], "1")
         self.assertEqual(values["PUMP1RUNNING"], "0")
         self.assertEqual(values["PO"], "3.50")
+        self.assertEqual(values["R"], "1234")
+        self.assertEqual(values["FR"], "1200")
+        self.assertEqual(values["F"], "99.50")
 
     def test_bad_status_is_rejected(self):
         bad_lines = (
             "OK,STOP",
-            "STATUS,X=0,Y=0,Z=0,SX=0,SY=0,SZ=0,L=00000,M=000,H=000,A=00,P=00,PI=2,PO=2",
+            "STATUS,X=0,Y=0,Z=0,SX=0,SY=0,SZ=0,L=00000,M=000,H=000,A=00,P=00,PI=2,PO=2,LC=1,T=0,R=0,FR=0,F=0",
             "STATUS,X=0,Y=0,Z=0,SX=0,SY=0,SZ=0,L=00000X,M=000,H=000,A=00,P=00,PI=2,PO=2",
             "STATUS,X=0,Y=0,Z=0,SX=0,SY=0,SZ=0,L=000000,M=00,H=000,A=00,P=00,PI=2,PO=2",
             "STATUS,X=no,Y=0,Z=0,SX=0,SY=0,SZ=0,L=000000,M=000,H=000,A=00,P=00,PI=2,PO=2",
@@ -67,14 +71,15 @@ class MotionProtocolTests(unittest.TestCase):
         self.assertEqual(lines, [])
         lines, buffer = extract_complete_lines(
             buffer,
-            b"GANTRY_M4\r\nSTATUS,X=0,Y=0,Z=0,SX=0,SY=0,SZ=0,"
-            b"L=000000,M=000,H=000,A=00,P=00,PI=2,PO=2\n",
+            b"GANTRY_M5\r\nSTATUS,X=0,Y=0,Z=0,SX=0,SY=0,SZ=0,"
+            b"L=000000,M=000,H=000,A=00,P=00,PI=2,PO=2,"
+            b"LC=1,T=0,R=0,FR=0,F=0\n",
         )
         self.assertEqual(
             lines,
             [
-                "IDENTITY,MEGA_GANTRY_M4",
-                "STATUS,X=0,Y=0,Z=0,SX=0,SY=0,SZ=0,L=000000,M=000,H=000,A=00,P=00,PI=2,PO=2",
+                "IDENTITY,MEGA_GANTRY_M5",
+                "STATUS,X=0,Y=0,Z=0,SX=0,SY=0,SZ=0,L=000000,M=000,H=000,A=00,P=00,PI=2,PO=2,LC=1,T=0,R=0,FR=0,F=0",
             ],
         )
         self.assertEqual(buffer, b"")
@@ -146,6 +151,19 @@ class MotionProtocolTests(unittest.TestCase):
         self.assertIn('strcmp(verb, "MOTION_STOP")', firmware)
         self.assertIn('self.send_command("PUMP START {}".format(pump_id))', ui)
         self.assertIn('self.send_command("PUMP STOP {}".format(pump_id))', ui)
+
+    def test_milestone_five_reads_s_type_load_cell_without_press_down(self):
+        firmware = (
+            ROOT / "mega_x_controller" / "mega_x_controller.ino"
+        ).read_text(encoding="utf-8")
+        ui = (ROOT / "x_control.py").read_text(encoding="utf-8")
+        self.assertIn("ADS1220_DRDY = 14", firmware)
+        self.assertIn("ADS1220_CS = 53", firmware)
+        self.assertIn("LOAD_CELL_CAL_SLOPE = 0.1165f", firmware)
+        self.assertIn("void serviceLoadCell()", firmware)
+        self.assertIn('strcmp(verb, "TARE")', firmware)
+        self.assertIn('self.send_command("TARE")', ui)
+        self.assertNotIn("PRESS_DOWN", firmware)
 
     def test_python_sources_parse_on_python_37_grammar(self):
         for relative_path in ("x_control.py", "tests/test_motion_protocol.py"):

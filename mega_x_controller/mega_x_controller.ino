@@ -1,17 +1,19 @@
 /*
-  Milestone 4: Arduino Mega XYZ motion and dual-pump control.
+  Milestone 5: Arduino Mega motion, pumps, and S-type load-cell reading.
 
   Scope: position reporting, jog, relative move, immediate software STOP,
   six limit inputs, dual-Y synchronized STEP pulses, homing to MINUS limits,
   independent machine/scan coordinates, dual-Y driver alarm interlock,
-  two fixed-direction peristaltic pumps, and a serial watchdog.
+  two fixed-direction peristaltic pumps, non-blocking ADS1220 force reading,
+  and a serial watchdog. Press-down automation is intentionally not included.
 */
 
 #include <Arduino.h>
+#include <SPI.h>
 #include <stdlib.h>
 #include <string.h>
 
-const char CONTROLLER_ID[] = "MEGA_GANTRY_M4";
+const char CONTROLLER_ID[] = "MEGA_GANTRY_M5";
 
 const uint8_t X_STEP = 2;
 const uint8_t X_DIR = 3;
@@ -33,6 +35,8 @@ const uint8_t PUMP_IN_STEP = 30;
 const uint8_t PUMP_IN_DIR = 31;
 const uint8_t PUMP_OUT_STEP = 32;
 const uint8_t PUMP_OUT_DIR = 33;
+const uint8_t ADS1220_DRDY = 14;
+const uint8_t ADS1220_CS = 53;
 
 const float STEPS_PER_MM = 160.0f;
 const float DEFAULT_SPEED_MM_S = 2.0f;
@@ -51,6 +55,14 @@ const float MIN_PUMP_RPM = 0.1f;
 const float MAX_PUMP_RPM = 20.0f;
 const uint16_t PUMP_HIGH_TICKS = 2;  // Timer3/4 /256: 32 us HIGH.
 const unsigned long PUMP_TIMER_TICKS_PER_SECOND = F_CPU / 256UL;
+const uint8_t ADS1220_CMD_RESET = 0x06;
+const uint8_t ADS1220_CMD_START = 0x08;
+const uint8_t ADS1220_CMD_RDATA = 0x10;
+const uint8_t ADS1220_CMD_WREG = 0x40;
+const float LOAD_CELL_CAL_SLOPE = 0.1165f;
+const float LOAD_CELL_CAL_INTERCEPT = -0.6286f;
+const uint8_t LOAD_CELL_FILTER_SAMPLES = 10;
+const uint8_t LOAD_CELL_TARE_SAMPLES = 30;
 const unsigned long STATUS_INTERVAL_MS = 100;
 const unsigned long COMMAND_WATCHDOG_MS = 750;
 const size_t COMMAND_BUFFER_SIZE = 96;
@@ -99,9 +111,100 @@ unsigned long lastStatusMillis = 0;
 unsigned long lastCommandMillis = 0;
 char commandBuffer[COMMAND_BUFFER_SIZE];
 size_t commandLength = 0;
+long loadCellRaw = 0;
+long loadCellFilteredRaw = 0;
+long loadCellTareRaw = 0;
+long loadCellFilterBuffer[LOAD_CELL_FILTER_SAMPLES];
+uint8_t loadCellFilterIndex = 0;
+uint8_t loadCellFilterCount = 0;
+int64_t loadCellFilterSum = 0;
+int64_t loadCellTareSum = 0;
+uint8_t loadCellTareCount = 0;
+bool loadCellHasReading = false;
+bool loadCellTareActive = true;
+bool loadCellTared = false;
+float loadCellForceGrams = 0.0f;
 
 uint16_t timerPeriodForSpeed(float speedMMPerSecond);
 uint16_t pumpTimerPeriod(float rpm);
+
+void ads1220Command(uint8_t command) {
+  digitalWrite(ADS1220_CS, LOW);
+  SPI.transfer(command);
+  digitalWrite(ADS1220_CS, HIGH);
+}
+
+void ads1220WriteRegister(uint8_t reg, uint8_t value) {
+  digitalWrite(ADS1220_CS, LOW);
+  delayMicroseconds(2);
+  SPI.transfer(ADS1220_CMD_WREG | (reg << 2));
+  SPI.transfer(value);
+  delayMicroseconds(2);
+  digitalWrite(ADS1220_CS, HIGH);
+}
+
+long ads1220ReadData() {
+  digitalWrite(ADS1220_CS, LOW);
+  SPI.transfer(ADS1220_CMD_RDATA);
+  uint8_t b1 = SPI.transfer(0xFF);
+  uint8_t b2 = SPI.transfer(0xFF);
+  uint8_t b3 = SPI.transfer(0xFF);
+  digitalWrite(ADS1220_CS, HIGH);
+  long value = (static_cast<long>(b1) << 16) |
+               (static_cast<long>(b2) << 8) | b3;
+  if (value & 0x800000L) value |= 0xFF000000L;
+  return value;
+}
+
+void beginTare() {
+  loadCellTareSum = 0;
+  loadCellTareCount = 0;
+  loadCellTareActive = true;
+  loadCellTared = false;
+}
+
+void updateLoadCellReading(long raw) {
+  loadCellRaw = raw;
+  if (loadCellFilterCount < LOAD_CELL_FILTER_SAMPLES) {
+    loadCellFilterBuffer[loadCellFilterIndex] = raw;
+    loadCellFilterSum += raw;
+    loadCellFilterCount++;
+  } else {
+    loadCellFilterSum -= loadCellFilterBuffer[loadCellFilterIndex];
+    loadCellFilterBuffer[loadCellFilterIndex] = raw;
+    loadCellFilterSum += raw;
+  }
+  loadCellFilterIndex =
+      (loadCellFilterIndex + 1) % LOAD_CELL_FILTER_SAMPLES;
+  loadCellFilteredRaw =
+      static_cast<long>(loadCellFilterSum / loadCellFilterCount);
+  loadCellHasReading = true;
+
+  if (loadCellTareActive) {
+    loadCellTareSum += raw;
+    loadCellTareCount++;
+    if (loadCellTareCount >= LOAD_CELL_TARE_SAMPLES) {
+      loadCellTareRaw =
+          static_cast<long>(loadCellTareSum / LOAD_CELL_TARE_SAMPLES);
+      loadCellTareActive = false;
+      loadCellTared = true;
+      Serial.print(F("EVENT,TARE_DONE,"));
+      Serial.println(loadCellTareRaw);
+    }
+  }
+
+  if (loadCellTared) {
+    loadCellForceGrams =
+        LOAD_CELL_CAL_SLOPE * (loadCellFilteredRaw - loadCellTareRaw) +
+        LOAD_CELL_CAL_INTERCEPT;
+  }
+}
+
+void serviceLoadCell() {
+  if (digitalRead(ADS1220_DRDY) != LOW) return;
+  updateLoadCellReading(ads1220ReadData());
+  ads1220Command(ADS1220_CMD_START);
+}
 
 bool limitTriggered(uint8_t pin) {
   return digitalRead(pin) == LOW;
@@ -527,7 +630,17 @@ void sendStatus(bool force) {
   Serial.print(F(",PI="));
   Serial.print(pumps[0].rpm, 2);
   Serial.print(F(",PO="));
-  Serial.println(pumps[1].rpm, 2);
+  Serial.print(pumps[1].rpm, 2);
+  Serial.print(F(",LC="));
+  Serial.print(loadCellHasReading ? 1 : 0);
+  Serial.print(F(",T="));
+  Serial.print(loadCellTareActive ? 1 : 0);
+  Serial.print(F(",R="));
+  Serial.print(loadCellRaw);
+  Serial.print(F(",FR="));
+  Serial.print(loadCellFilteredRaw);
+  Serial.print(F(",F="));
+  Serial.println(loadCellTared ? loadCellForceGrams : 0.0f, 2);
 }
 
 bool parseFloatStrict(const char *token, float &value) {
@@ -564,6 +677,12 @@ void processCommand(char *command) {
   if (strcmp(verb, "MOTION_STOP") == 0) {
     stopAll();
     Serial.println(F("OK,MOTION_STOP"));
+    sendStatus(true);
+    return;
+  }
+  if (strcmp(verb, "TARE") == 0) {
+    beginTare();
+    Serial.println(F("OK,TARE_STARTED"));
     sendStatus(true);
     return;
   }
@@ -754,10 +873,27 @@ void setup() {
   pinMode(PUMP_IN_DIR, OUTPUT);
   pinMode(PUMP_OUT_STEP, OUTPUT);
   pinMode(PUMP_OUT_DIR, OUTPUT);
+  pinMode(ADS1220_CS, OUTPUT);
+  pinMode(ADS1220_DRDY, INPUT);
   digitalWrite(PUMP_IN_STEP, LOW);
   digitalWrite(PUMP_OUT_STEP, LOW);
   digitalWrite(PUMP_IN_DIR, LOW);
   digitalWrite(PUMP_OUT_DIR, LOW);
+  digitalWrite(ADS1220_CS, HIGH);
+
+  SPI.begin();
+  SPI.beginTransaction(SPISettings(1000000, MSBFIRST, SPI_MODE1));
+  delay(100);
+  ads1220Command(ADS1220_CMD_RESET);
+  delay(10);
+  // Preserve the register configuration from the verified S-type load-cell
+  // sketch. Conversion is serviced asynchronously in loop().
+  ads1220WriteRegister(0, 0x00);
+  ads1220WriteRegister(1, 0x00);
+  ads1220WriteRegister(2, 0x00);
+  ads1220WriteRegister(3, 0x00);
+  beginTare();
+  ads1220Command(ADS1220_CMD_START);
 
   applyPumpSpeed(0, DEFAULT_PUMP_RPM);
   applyPumpSpeed(1, DEFAULT_PUMP_RPM);
@@ -771,6 +907,7 @@ void setup() {
 
 void loop() {
   readSerial();
+  serviceLoadCell();
 
   AxisState *axis = activeAxis;
   if (axis != NULL && axis->name == 'Y' && anyYAlarm()) {

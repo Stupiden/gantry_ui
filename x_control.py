@@ -1,4 +1,4 @@
-"""Milestone 4: XYZ motion, safety, coordinates, and dual-pump control."""
+"""Milestone 5: motion, pumps, and S-type load-cell monitoring."""
 
 import sys
 import time
@@ -10,7 +10,7 @@ import serial.tools.list_ports
 
 
 BAUD_RATE = 115200
-CONTROLLER_ID = "MEGA_GANTRY_M4"
+CONTROLLER_ID = "MEGA_GANTRY_M5"
 DEFAULT_SPEED_MM_S = 2.0
 DEFAULT_PUMP_RPM = 2.0
 SERIAL_POLL_MS = 20
@@ -73,8 +73,12 @@ def parse_status_line(line):
     values["PUMP0RUNNING"] = packed_pumps[0]
     values["PUMP1RUNNING"] = packed_pumps[1]
 
-    for key in ("X", "Y", "Z", "SX", "SY", "SZ", "PI", "PO"):
+    for key in (
+        "X", "Y", "Z", "SX", "SY", "SZ", "PI", "PO", "R", "FR", "F"
+    ):
         float(values[key])
+    if values.get("LC") not in ("0", "1") or values.get("T") not in ("0", "1"):
+        raise ValueError("invalid load-cell state")
     return values
 
 
@@ -99,7 +103,7 @@ class GantryMotionUI(tk.Tk):
 
     def __init__(self):
         tk.Tk.__init__(self)
-        self.title("Gantry Motion Control — Milestone 4")
+        self.title("Gantry Motion Control — Milestone 5")
         self.geometry("900x800")
         self.minsize(800, 720)
         self.option_add("*Font", ("Segoe UI", 9))
@@ -137,6 +141,10 @@ class GantryMotionUI(tk.Tk):
             tk.StringVar(value="STOPPED"),
             tk.StringVar(value="STOPPED"),
         ]
+        self.load_cell_raw_var = tk.StringVar(value="—")
+        self.load_cell_filtered_var = tk.StringVar(value="—")
+        self.load_cell_force_var = tk.StringVar(value="— g")
+        self.load_cell_status_var = tk.StringVar(value="WAITING")
         self.limit_vars = {
             name: tk.StringVar(value="SAFE") for name in self.LIMITS
         }
@@ -178,6 +186,7 @@ class GantryMotionUI(tk.Tk):
         self.build_home_panel(body)
         self.build_relative_move_panel(body)
         self.build_limit_panel(body)
+        self.build_load_cell_panel(body)
         self.build_pump_panel(body)
         self.build_alarm_panel(body)
         self.build_stop_panel(body)
@@ -377,7 +386,7 @@ class GantryMotionUI(tk.Tk):
 
     def build_stop_panel(self, parent):
         frame = ttk.Frame(parent)
-        frame.grid(row=8, column=0, sticky="ew", pady=(5, 0))
+        frame.grid(row=9, column=0, sticky="ew", pady=(5, 0))
         frame.columnconfigure(0, weight=1)
 
         self.stop_button = tk.Button(
@@ -400,7 +409,7 @@ class GantryMotionUI(tk.Tk):
 
     def build_alarm_panel(self, parent):
         frame = ttk.LabelFrame(parent, text="Y driver alarms", padding=6)
-        frame.grid(row=7, column=0, sticky="ew", pady=4)
+        frame.grid(row=8, column=0, sticky="ew", pady=4)
         for column in range(2):
             frame.columnconfigure(column, weight=1)
 
@@ -419,7 +428,7 @@ class GantryMotionUI(tk.Tk):
 
     def build_pump_panel(self, parent):
         frame = ttk.LabelFrame(parent, text="Peristaltic pumps — clockwise", padding=6)
-        frame.grid(row=6, column=0, sticky="ew", pady=4)
+        frame.grid(row=7, column=0, sticky="ew", pady=4)
         for column in range(2):
             frame.columnconfigure(column, weight=1)
 
@@ -467,6 +476,33 @@ class GantryMotionUI(tk.Tk):
             start_button.grid(row=2, column=0, sticky="ew", pady=(8, 0), padx=(0, 4))
             stop_button.grid(row=2, column=1, sticky="ew", pady=(8, 0), padx=(4, 0))
             self.motion_widgets.extend((speed_box, start_button, stop_button))
+
+    def build_load_cell_panel(self, parent):
+        frame = ttk.LabelFrame(parent, text="S-type load cell", padding=6)
+        frame.grid(row=6, column=0, sticky="ew", pady=4)
+        for column in range(8):
+            frame.columnconfigure(column, weight=1 if column in (1, 3, 5) else 0)
+
+        ttk.Label(frame, text="RAW:").grid(row=0, column=0, padx=(0, 4))
+        ttk.Label(frame, textvariable=self.load_cell_raw_var).grid(
+            row=0, column=1, sticky="w", padx=(0, 12)
+        )
+        ttk.Label(frame, text="Filtered RAW:").grid(row=0, column=2, padx=(0, 4))
+        ttk.Label(frame, textvariable=self.load_cell_filtered_var).grid(
+            row=0, column=3, sticky="w", padx=(0, 12)
+        )
+        ttk.Label(frame, text="Force:").grid(row=0, column=4, padx=(0, 4))
+        ttk.Label(
+            frame,
+            textvariable=self.load_cell_force_var,
+            font=("Segoe UI", 10, "bold"),
+        ).grid(row=0, column=5, sticky="w", padx=(0, 12))
+        ttk.Label(frame, textvariable=self.load_cell_status_var).grid(
+            row=0, column=6, padx=(0, 8)
+        )
+        tare_button = ttk.Button(frame, text="TARE", command=self.tare_load_cell)
+        tare_button.grid(row=0, column=7)
+        self.motion_widgets.append(tare_button)
 
     def refresh_ports(self):
         if self.is_serial_open():
@@ -556,6 +592,10 @@ class GantryMotionUI(tk.Tk):
             self.moving_vars[axis].set("IDLE")
         for pump_status in self.pump_status_vars:
             pump_status.set("STOPPED")
+        self.load_cell_raw_var.set("—")
+        self.load_cell_filtered_var.set("—")
+        self.load_cell_force_var.set("— g")
+        self.load_cell_status_var.set("WAITING")
 
     def is_serial_open(self):
         return self.serial_port is not None and self.serial_port.is_open
@@ -687,6 +727,15 @@ class GantryMotionUI(tk.Tk):
             self.pump_status_vars[1].set(
                 "RUNNING" if values["PUMP1RUNNING"] == "1" else "STOPPED"
             )
+            if values["LC"] == "1":
+                self.load_cell_raw_var.set(values["R"])
+                self.load_cell_filtered_var.set(values["FR"])
+                self.load_cell_force_var.set("{:.2f} g".format(float(values["F"])))
+                self.load_cell_status_var.set(
+                    "TARING" if values["T"] == "1" else "READY"
+                )
+            else:
+                self.load_cell_status_var.set("WAITING")
         except (KeyError, ValueError):
             self.status_var.set("Invalid STATUS: {}".format(line))
 
@@ -790,6 +839,10 @@ class GantryMotionUI(tk.Tk):
 
     def stop_pump(self, pump_id):
         self.send_command("PUMP STOP {}".format(pump_id))
+
+    def tare_load_cell(self):
+        self.load_cell_status_var.set("TARING")
+        self.send_command("TARE")
 
     def emergency_stop(self):
         self.send_command("STOP", require_ready=False)
