@@ -1,16 +1,17 @@
 /*
-  Milestone 2: Arduino Mega XYZ homing and coordinate foundation.
+  Milestone 3: Arduino Mega XYZ motion with dual-Y alarm safety.
 
   Scope: position reporting, jog, relative move, immediate software STOP,
   six limit inputs, dual-Y synchronized STEP pulses, homing to MINUS limits,
-  independent machine/scan coordinates, and a serial watchdog.
+  independent machine/scan coordinates, dual-Y driver alarm interlock,
+  and a serial watchdog.
 */
 
 #include <Arduino.h>
 #include <stdlib.h>
 #include <string.h>
 
-const char CONTROLLER_ID[] = "MEGA_GANTRY_M2";
+const char CONTROLLER_ID[] = "MEGA_GANTRY_M3";
 
 const uint8_t X_STEP = 2;
 const uint8_t X_DIR = 3;
@@ -26,6 +27,8 @@ const uint8_t X_MINUS = 22;
 const uint8_t X_PLUS = 24;
 const uint8_t Z_MINUS = 25;
 const uint8_t Z_PLUS = 28;
+const uint8_t Y1_ALARM = 37;
+const uint8_t Y2_ALARM = 38;
 
 const float STEPS_PER_MM = 160.0f;
 const float DEFAULT_SPEED_MM_S = 2.0f;
@@ -78,6 +81,30 @@ uint16_t timerPeriodForSpeed(float speedMMPerSecond);
 
 bool limitTriggered(uint8_t pin) {
   return digitalRead(pin) == LOW;
+}
+
+bool alarmTriggered(uint8_t pin) {
+  // Verified wiring: open/HIGH is normal; closed/LOW is alarm.
+  return digitalRead(pin) == LOW;
+}
+
+bool anyYAlarm() {
+  return alarmTriggered(Y1_ALARM) || alarmTriggered(Y2_ALARM);
+}
+
+bool yMotionAllowed(const AxisState &axis) {
+  return axis.name != 'Y' || !anyYAlarm();
+}
+
+void reportYAlarmBlocked() {
+  bool y1 = alarmTriggered(Y1_ALARM);
+  bool y2 = alarmTriggered(Y2_ALARM);
+  Serial.print(F("ERROR,Y_ALARM_ACTIVE,"));
+  if (y1 && y2) {
+    Serial.println(F("BOTH"));
+  } else {
+    Serial.println(y1 ? F("Y1") : F("Y2"));
+  }
 }
 
 AxisState *axisFromName(const char *token) {
@@ -177,6 +204,10 @@ void startTimer(AxisState &axis) {
 }
 
 bool startJog(AxisState &axis, int8_t direction) {
+  if (!yMotionAllowed(axis)) {
+    reportYAlarmBlocked();
+    return false;
+  }
   if (!movementAllowed(axis, direction)) {
     Serial.print(F("ERROR,LIMIT_BLOCKED,"));
     Serial.print(axis.name);
@@ -195,6 +226,10 @@ bool startJog(AxisState &axis, int8_t direction) {
 }
 
 bool startRelativeMove(AxisState &axis, float distanceMM) {
+  if (!yMotionAllowed(axis)) {
+    reportYAlarmBlocked();
+    return false;
+  }
   long signedSteps = lround(distanceMM * STEPS_PER_MM);
   if (signedSteps == 0) {
     Serial.println(F("ERROR,MOVE_TOO_SMALL"));
@@ -351,7 +386,11 @@ void sendStatus(bool force) {
   Serial.print(F(",H="));
   Serial.print(xAxis.homed ? 1 : 0);
   Serial.print(yAxis.homed ? 1 : 0);
-  Serial.println(zAxis.homed ? 1 : 0);
+  Serial.print(zAxis.homed ? 1 : 0);
+  // A order: Y1, Y2. Alarm inputs are active LOW.
+  Serial.print(F(",A="));
+  Serial.print(alarmTriggered(Y1_ALARM) ? 1 : 0);
+  Serial.println(alarmTriggered(Y2_ALARM) ? 1 : 0);
 }
 
 bool parseFloatStrict(const char *token, float &value) {
@@ -400,6 +439,11 @@ void processCommand(char *command) {
     AxisState *axis = axisFromName(strtok_r(NULL, " ", &savePointer));
     if (axis == NULL) {
       Serial.println(F("ERROR,BAD_HOME"));
+      return;
+    }
+    if (!yMotionAllowed(*axis)) {
+      reportYAlarmBlocked();
+      sendStatus(true);
       return;
     }
     bool started = startHome(*axis);
@@ -516,6 +560,10 @@ void setup() {
   pinMode(Y_PLUS, INPUT_PULLUP);
   pinMode(Z_MINUS, INPUT_PULLUP);
   pinMode(Z_PLUS, INPUT_PULLUP);
+  // External 4.7 kOhm pull-ups are installed; INPUT_PULLUP also prevents a
+  // floating input if an external connection is temporarily open.
+  pinMode(Y1_ALARM, INPUT_PULLUP);
+  pinMode(Y2_ALARM, INPUT_PULLUP);
 
   applySpeed(DEFAULT_SPEED_MM_S);
   lastCommandMillis = millis();
@@ -528,6 +576,20 @@ void loop() {
   readSerial();
 
   AxisState *axis = activeAxis;
+  if (axis != NULL && axis->name == 'Y' && anyYAlarm()) {
+    bool y1 = alarmTriggered(Y1_ALARM);
+    bool y2 = alarmTriggered(Y2_ALARM);
+    stopAll();
+    Serial.print(F("EVENT,ALARM_STOP,"));
+    if (y1 && y2) {
+      Serial.println(F("BOTH"));
+    } else {
+      Serial.println(y1 ? F("Y1") : F("Y2"));
+    }
+    sendStatus(true);
+    axis = NULL;
+  }
+
   if (axis != NULL && !movementAllowed(*axis, axis->direction)) {
     char axisName = axis->name;
     MotionMode stoppedMode = axis->mode;

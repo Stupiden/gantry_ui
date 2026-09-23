@@ -1,4 +1,4 @@
-"""Milestone 2: XYZ motion, homing, and machine/scan coordinates."""
+"""Milestone 3: XYZ motion, coordinates, and dual-Y alarm safety."""
 
 import sys
 import time
@@ -10,7 +10,7 @@ import serial.tools.list_ports
 
 
 BAUD_RATE = 115200
-CONTROLLER_ID = "MEGA_GANTRY_M2"
+CONTROLLER_ID = "MEGA_GANTRY_M3"
 DEFAULT_SPEED_MM_S = 2.0
 SERIAL_POLL_MS = 20
 PORT_REFRESH_MS = 1500
@@ -56,6 +56,14 @@ def parse_status_line(line):
     for axis, state in zip(("X", "Y", "Z"), packed_homed):
         values["{}HOMED".format(axis)] = state
 
+    packed_alarms = values.get("A")
+    if packed_alarms is None or len(packed_alarms) != 2:
+        raise ValueError("invalid packed alarm field")
+    if any(state not in "01" for state in packed_alarms):
+        raise ValueError("invalid packed alarm state")
+    values["Y1ALARM"] = packed_alarms[0]
+    values["Y2ALARM"] = packed_alarms[1]
+
     for key in ("X", "Y", "Z", "SX", "SY", "SZ"):
         float(values[key])
     return values
@@ -78,12 +86,13 @@ def extract_complete_lines(buffer, chunk):
 class GantryMotionUI(tk.Tk):
     AXES = ("X", "Y", "Z")
     LIMITS = ("XMIN", "XPLUS", "YMIN", "YPLUS", "ZMIN", "ZPLUS")
+    ALARMS = ("Y1ALARM", "Y2ALARM")
 
     def __init__(self):
         tk.Tk.__init__(self)
-        self.title("Gantry Motion Control — Milestone 2")
-        self.geometry("900x780")
-        self.minsize(800, 700)
+        self.title("Gantry Motion Control — Milestone 3")
+        self.geometry("900x840")
+        self.minsize(800, 760)
 
         self.serial_port = None
         self.controller_ready = False
@@ -119,6 +128,7 @@ class GantryMotionUI(tk.Tk):
 
         self.motion_widgets = []
         self.limit_labels = {}
+        self.alarm_labels = {}
         self.build_ui()
         self.set_motion_enabled(False)
         self.refresh_ports()
@@ -150,6 +160,7 @@ class GantryMotionUI(tk.Tk):
         self.build_home_panel(body)
         self.build_relative_move_panel(body)
         self.build_limit_panel(body)
+        self.build_alarm_panel(body)
         self.build_stop_panel(body)
 
     def build_connection_panel(self, parent):
@@ -347,7 +358,7 @@ class GantryMotionUI(tk.Tk):
 
     def build_stop_panel(self, parent):
         frame = ttk.Frame(parent)
-        frame.grid(row=6, column=0, sticky="ew", pady=(10, 0))
+        frame.grid(row=7, column=0, sticky="ew", pady=(10, 0))
         frame.columnconfigure(0, weight=1)
 
         self.stop_button = tk.Button(
@@ -367,6 +378,25 @@ class GantryMotionUI(tk.Tk):
         ttk.Label(frame, textvariable=self.status_var, anchor="w").grid(
             row=1, column=0, sticky="ew", pady=(8, 0)
         )
+
+    def build_alarm_panel(self, parent):
+        frame = ttk.LabelFrame(parent, text="Y driver alarms", padding=10)
+        frame.grid(row=6, column=0, sticky="ew", pady=8)
+        for column in range(2):
+            frame.columnconfigure(column, weight=1)
+
+        for column, key in enumerate(self.ALARMS):
+            display_name = "Y1" if key == "Y1ALARM" else "Y2"
+            label = tk.Label(
+                frame,
+                text="{} NORMAL".format(display_name),
+                fg="#187a2f",
+                font=("Segoe UI", 11, "bold"),
+                padx=5,
+                pady=8,
+            )
+            label.grid(row=0, column=column, sticky="ew")
+            self.alarm_labels[key] = (label, display_name)
 
     def refresh_ports(self):
         if self.is_serial_open():
@@ -536,7 +566,12 @@ class GantryMotionUI(tk.Tk):
 
         if line.startswith("EVENT,") or line.startswith("ERROR,"):
             self.status_var.set(line)
-            if "STOP" in line or "LIMIT" in line or "WATCHDOG" in line:
+            if (
+                "STOP" in line
+                or "LIMIT" in line
+                or "WATCHDOG" in line
+                or "ALARM" in line
+            ):
                 self.jog_axis = None
             return
 
@@ -570,6 +605,8 @@ class GantryMotionUI(tk.Tk):
 
             for key in self.LIMITS:
                 self.update_limit(key, values.get(key, "0") == "1")
+            for key in self.ALARMS:
+                self.update_alarm(key, values.get(key, "0") == "1")
         except (KeyError, ValueError):
             self.status_var.set("Invalid STATUS: {}".format(line))
 
@@ -579,6 +616,13 @@ class GantryMotionUI(tk.Tk):
             label.configure(text="{} TRIGGERED".format(display_name), fg="#b00020")
         else:
             label.configure(text="{} SAFE".format(display_name), fg="#187a2f")
+
+    def update_alarm(self, key, triggered):
+        label, display_name = self.alarm_labels[key]
+        if triggered:
+            label.configure(text="{} ALARM".format(display_name), fg="#b00020")
+        else:
+            label.configure(text="{} NORMAL".format(display_name), fg="#187a2f")
 
     def validated_speed(self):
         try:
