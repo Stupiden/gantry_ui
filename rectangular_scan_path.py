@@ -59,7 +59,7 @@ class RectangularScanPathWindow(tk.Toplevel):
 
     def __init__(
         self, parent, dry_run_callback=None, press_cycle_callback=None,
-        pump_cycle_callback=None
+        pump_cycle_callback=None, full_cv_callback=None
     ):
         tk.Toplevel.__init__(self, parent)
         self.title("Rectangular scan path — preview only")
@@ -80,6 +80,7 @@ class RectangularScanPathWindow(tk.Toplevel):
         self.dry_run_callback = dry_run_callback
         self.press_cycle_callback = press_cycle_callback
         self.pump_cycle_callback = pump_cycle_callback
+        self.full_cv_callback = full_cv_callback
         self._build_ui()
 
     def _build_ui(self):
@@ -130,6 +131,10 @@ class RectangularScanPathWindow(tk.Toplevel):
             controls, text="PUMP CYCLE", command=self.start_pump_cycle, state="disabled"
         )
         self.pump_cycle_button.grid(row=4, column=7, padx=4)
+        self.full_cv_button = ttk.Button(
+            controls, text="FULL CV CYCLE", command=self.start_full_cv, state="disabled"
+        )
+        self.full_cv_button.grid(row=5, column=7, padx=4)
         ttk.Label(controls, textvariable=self.summary_var).grid(
             row=3, column=0, columnspan=8, sticky="w", pady=(6, 0)
         )
@@ -260,6 +265,8 @@ class RectangularScanPathWindow(tk.Toplevel):
             self.press_cycle_button.configure(state="normal")
         if self.pump_cycle_callback is not None:
             self.pump_cycle_button.configure(state="normal")
+        if self.full_cv_callback is not None:
+            self.full_cv_button.configure(state="normal")
 
     def start_dry_run(self):
         if self.points and self.dry_run_callback is not None:
@@ -272,6 +279,10 @@ class RectangularScanPathWindow(tk.Toplevel):
     def start_pump_cycle(self):
         if self.points and self.pump_cycle_callback is not None:
             self.pump_cycle_callback(self.points, "Rectangular path")
+
+    def start_full_cv(self):
+        if self.points and self.full_cv_callback is not None:
+            self.full_cv_callback(self.points, "Rectangular path")
 
     def export_csv(self):
         if not self.points:

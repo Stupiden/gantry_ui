@@ -64,7 +64,7 @@ class CircularScanPathWindow(tk.Toplevel):
 
     def __init__(
         self, parent, dry_run_callback=None, press_cycle_callback=None,
-        pump_cycle_callback=None
+        pump_cycle_callback=None, full_cv_callback=None
     ):
         tk.Toplevel.__init__(self, parent)
         self.title("Circular scan path — preview only")
@@ -81,6 +81,7 @@ class CircularScanPathWindow(tk.Toplevel):
         self.dry_run_callback = dry_run_callback
         self.press_cycle_callback = press_cycle_callback
         self.pump_cycle_callback = pump_cycle_callback
+        self.full_cv_callback = full_cv_callback
 
         self._build_ui()
 
@@ -123,6 +124,10 @@ class CircularScanPathWindow(tk.Toplevel):
             controls, text="PUMP CYCLE", command=self.start_pump_cycle, state="disabled"
         )
         self.pump_cycle_button.grid(row=3, column=10, columnspan=2, padx=4, pady=(5, 0))
+        self.full_cv_button = ttk.Button(
+            controls, text="FULL CV CYCLE", command=self.start_full_cv, state="disabled"
+        )
+        self.full_cv_button.grid(row=4, column=10, columnspan=2, padx=4, pady=(5, 0))
         ttk.Label(controls, textvariable=self.summary_var).grid(
             row=1, column=0, columnspan=12, sticky="w", pady=(7, 0)
         )
@@ -238,6 +243,8 @@ class CircularScanPathWindow(tk.Toplevel):
             self.press_cycle_button.configure(state="normal")
         if self.pump_cycle_callback is not None:
             self.pump_cycle_button.configure(state="normal")
+        if self.full_cv_callback is not None:
+            self.full_cv_button.configure(state="normal")
 
     def start_dry_run(self):
         if self.points and self.dry_run_callback is not None:
@@ -250,6 +257,10 @@ class CircularScanPathWindow(tk.Toplevel):
     def start_pump_cycle(self):
         if self.points and self.pump_cycle_callback is not None:
             self.pump_cycle_callback(self.points, "Circular path")
+
+    def start_full_cv(self):
+        if self.points and self.full_cv_callback is not None:
+            self.full_cv_callback(self.points, "Circular path")
 
     def export_csv(self):
         if not self.points:

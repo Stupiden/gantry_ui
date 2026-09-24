@@ -370,6 +370,24 @@ class MotionProtocolTests(unittest.TestCase):
         self.assertLess(source.index("self._stop_pump(pump_id)"), source.index('self.press_state = "lifting"'))
         self.assertNotIn("gamry_pstat", source)
 
+    def test_full_cv_cycle_measures_before_lift_and_saves_per_point(self):
+        source = (ROOT / "xy_full_cv_cycle.py").read_text(encoding="utf-8")
+        runner = (ROOT / "auto_cv_measurement.py").read_text(encoding="utf-8")
+        self.assertIn("AutoCVMeasurement", source)
+        self.assertIn("CV_point_{:04d}", source)
+        self.assertLess(source.index('"PUMP START {}"'), source.index("self.cv_runner.start("))
+        self.assertLess(source.index("self.cv_runner.start("), source.index('self.press_state = "lifting"'))
+        cv_complete = source[source.index("    def _cv_complete"):source.index("    def _start_lift_after_wait")]
+        self.assertIn("self.pump_after_ids[pump_id] = self.after(", cv_complete)
+        self.assertIn("self._pump_time_complete(selected_id)", cv_complete)
+        lift_wait = source[source.index("    def _start_lift_after_wait"):source.index("    def _cv_error")]
+        self.assertIn("self.reported_pump_states != (False, False)", lift_wait)
+        self.assertIn('"LIFT {:.3f} {:.3f}"', lift_wait)
+        self.assertIn("initialize_pstat_for_cv", runner)
+        self.assertIn("self.pstat.set_cell(True)", runner)
+        self.assertIn("self.pstat.set_cell(False)", runner)
+        self.assertIn('"point_index", "scan_x_mm", "scan_y_mm"', runner)
+
     def test_python_sources_parse_on_python_37_grammar(self):
         for relative_path in (
             "x_control.py",
@@ -382,6 +400,8 @@ class MotionProtocolTests(unittest.TestCase):
             "xy_dry_run.py",
             "xy_press_cycle.py",
             "xy_pump_cycle.py",
+            "auto_cv_measurement.py",
+            "xy_full_cv_cycle.py",
             "tests/test_motion_protocol.py",
         ):
             source = (ROOT / relative_path).read_text(encoding="utf-8")
