@@ -57,7 +57,7 @@ def generate_rectangular_path(
 class RectangularScanPathWindow(tk.Toplevel):
     """Generate, inspect, plot, and export a rectangular path without motion."""
 
-    def __init__(self, parent):
+    def __init__(self, parent, dry_run_callback=None):
         tk.Toplevel.__init__(self, parent)
         self.title("Rectangular scan path — preview only")
         self.geometry("1040x680")
@@ -74,6 +74,7 @@ class RectangularScanPathWindow(tk.Toplevel):
         self.serpentine_var = tk.BooleanVar(value=True)
         self.summary_var = tk.StringVar(value="No path generated")
         self.points = []
+        self.dry_run_callback = dry_run_callback
         self._build_ui()
 
     def _build_ui(self):
@@ -112,6 +113,10 @@ class RectangularScanPathWindow(tk.Toplevel):
             controls, text="EXPORT CSV", command=self.export_csv, state="disabled"
         )
         self.export_button.grid(row=1, column=7, padx=4)
+        self.dry_run_button = ttk.Button(
+            controls, text="XY DRY RUN", command=self.start_dry_run, state="disabled"
+        )
+        self.dry_run_button.grid(row=2, column=7, padx=4)
         ttk.Label(controls, textvariable=self.summary_var).grid(
             row=3, column=0, columnspan=8, sticky="w", pady=(6, 0)
         )
@@ -236,6 +241,12 @@ class RectangularScanPathWindow(tk.Toplevel):
             )
         )
         self.export_button.configure(state="normal")
+        if self.dry_run_callback is not None:
+            self.dry_run_button.configure(state="normal")
+
+    def start_dry_run(self):
+        if self.points and self.dry_run_callback is not None:
+            self.dry_run_callback(self.points, "Rectangular path")
 
     def export_csv(self):
         if not self.points:

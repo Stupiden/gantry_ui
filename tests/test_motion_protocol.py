@@ -317,6 +317,16 @@ class MotionProtocolTests(unittest.TestCase):
         self.assertIn('label="Path:', source)
         self.assertIn('label="Reference:', source)
 
+    def test_xy_dry_run_is_xy_only_and_waits_for_move_done(self):
+        source = (ROOT / "xy_dry_run.py").read_text(encoding="utf-8")
+        self.assertIn('"MOVE {} {:.3f}".format(axis, delta)', source)
+        self.assertIn('line == "EVENT,MOVE_DONE,X"', source)
+        self.assertIn('line == "EVENT,MOVE_DONE,Y"', source)
+        self.assertIn('self.send_command("MOTION_STOP")', source)
+        self.assertNotIn('"PRESS ', source)
+        self.assertNotIn('"PUMP ', source)
+        self.assertNotIn("gamry_pstat", source)
+
     def test_python_sources_parse_on_python_37_grammar(self):
         for relative_path in (
             "x_control.py",
@@ -326,6 +336,7 @@ class MotionProtocolTests(unittest.TestCase):
             "pre_gamry_eis_getru_max.py",
             "circular_scan_path.py",
             "rectangular_scan_path.py",
+            "xy_dry_run.py",
             "tests/test_motion_protocol.py",
         ):
             source = (ROOT / relative_path).read_text(encoding="utf-8")
