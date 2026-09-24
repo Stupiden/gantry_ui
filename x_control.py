@@ -13,6 +13,7 @@ from gamry_cv_manual import ManualCVWindow
 from gamry_ca_manual import ManualCAWindow
 from gamry_eis_manual import ManualEISWindow
 from circular_scan_path import CircularScanPathWindow
+from rectangular_scan_path import RectangularScanPathWindow
 
 try:
     import toolkitpy as tkp
@@ -137,6 +138,7 @@ class GantryMotionUI(tk.Tk):
         self.ca_window = None
         self.eis_window = None
         self.circular_path_window = None
+        self.rectangular_path_window = None
         self.gamry_measurement_owner = None
 
         self.port_var = tk.StringVar()
@@ -603,7 +605,16 @@ class GantryMotionUI(tk.Tk):
             text="CIRCULAR PATH PREVIEW",
             command=self.open_circular_path_window,
         )
-        circular_path_button.grid(row=1, column=0, columnspan=4, sticky="ew", padx=4, pady=(4, 0))
+        circular_path_button.grid(row=1, column=0, columnspan=2, sticky="ew", padx=4, pady=(4, 0))
+
+        rectangular_path_button = ttk.Button(
+            frame,
+            text="RECTANGULAR PATH PREVIEW",
+            command=self.open_rectangular_path_window,
+        )
+        rectangular_path_button.grid(
+            row=1, column=2, columnspan=2, sticky="ew", padx=4, pady=(4, 0)
+        )
 
     def open_circular_path_window(self):
         if self.circular_path_window is not None and self.circular_path_window.winfo_exists():
@@ -611,6 +622,13 @@ class GantryMotionUI(tk.Tk):
             self.circular_path_window.focus_force()
             return
         self.circular_path_window = CircularScanPathWindow(self)
+
+    def open_rectangular_path_window(self):
+        if self.rectangular_path_window is not None and self.rectangular_path_window.winfo_exists():
+            self.rectangular_path_window.lift()
+            self.rectangular_path_window.focus_force()
+            return
+        self.rectangular_path_window = RectangularScanPathWindow(self)
 
     def build_limit_panel(self, parent):
         frame = ttk.LabelFrame(parent, text="Limit switches", padding=4)

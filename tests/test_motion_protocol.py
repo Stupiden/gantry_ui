@@ -24,6 +24,7 @@ if "serial" not in sys.modules:
 sys.path.insert(0, str(ROOT))
 from x_control import extract_complete_lines, parse_status_line  # noqa: E402
 from circular_scan_path import generate_circular_path  # noqa: E402
+from rectangular_scan_path import generate_rectangular_path  # noqa: E402
 
 
 class MotionProtocolTests(unittest.TestCase):
@@ -287,6 +288,35 @@ class MotionProtocolTests(unittest.TestCase):
         self.assertIn("Path circle: D=", source)
         self.assertIn("Reference circle: D=", source)
 
+    def test_rectangular_scan_path_is_centered_and_serpentine(self):
+        points = generate_rectangular_path(10.0, 20.0, 4.0, 2.0, 2.0, 1.0, True)
+        self.assertEqual(len(points), 9)
+        self.assertEqual(
+            [(point["x"], point["y"]) for point in points],
+            [
+                (8.0, 19.0), (10.0, 19.0), (12.0, 19.0),
+                (12.0, 20.0), (10.0, 20.0), (8.0, 20.0),
+                (8.0, 21.0), (10.0, 21.0), (12.0, 21.0),
+            ],
+        )
+
+    def test_rectangular_scan_path_can_disable_serpentine(self):
+        points = generate_rectangular_path(0.0, 0.0, 2.0, 1.0, 1.0, 1.0, False)
+        self.assertEqual(
+            [(point["x"], point["y"]) for point in points],
+            [(-1.0, -0.5), (0.0, -0.5), (1.0, -0.5),
+             (-1.0, 0.5), (0.0, 0.5), (1.0, 0.5)],
+        )
+
+    def test_rectangular_scan_preview_has_path_and_reference_rectangles(self):
+        source = (ROOT / "rectangular_scan_path.py").read_text(encoding="utf-8")
+        self.assertIn("self.width_var = tk.DoubleVar(value=10.0)", source)
+        self.assertIn("self.height_var = tk.DoubleVar(value=10.0)", source)
+        self.assertIn("self.reference_width_var = tk.DoubleVar(value=20.0)", source)
+        self.assertIn("self.reference_height_var = tk.DoubleVar(value=20.0)", source)
+        self.assertIn('label="Path:', source)
+        self.assertIn('label="Reference:', source)
+
     def test_python_sources_parse_on_python_37_grammar(self):
         for relative_path in (
             "x_control.py",
@@ -295,6 +325,7 @@ class MotionProtocolTests(unittest.TestCase):
             "gamry_eis_manual.py",
             "pre_gamry_eis_getru_max.py",
             "circular_scan_path.py",
+            "rectangular_scan_path.py",
             "tests/test_motion_protocol.py",
         ):
             source = (ROOT / relative_path).read_text(encoding="utf-8")
