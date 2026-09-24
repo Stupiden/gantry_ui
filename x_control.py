@@ -12,6 +12,7 @@ import serial.tools.list_ports
 from gamry_cv_manual import ManualCVWindow
 from gamry_ca_manual import ManualCAWindow
 from gamry_eis_manual import ManualEISWindow
+from circular_scan_path import CircularScanPathWindow
 
 try:
     import toolkitpy as tkp
@@ -135,6 +136,7 @@ class GantryMotionUI(tk.Tk):
         self.cv_window = None
         self.ca_window = None
         self.eis_window = None
+        self.circular_path_window = None
         self.gamry_measurement_owner = None
 
         self.port_var = tk.StringVar()
@@ -595,6 +597,20 @@ class GantryMotionUI(tk.Tk):
         )
         scan_zero_button.grid(row=0, column=3, sticky="ew", padx=4)
         self.motion_widgets.append(scan_zero_button)
+
+        circular_path_button = ttk.Button(
+            frame,
+            text="CIRCULAR PATH PREVIEW",
+            command=self.open_circular_path_window,
+        )
+        circular_path_button.grid(row=1, column=0, columnspan=4, sticky="ew", padx=4, pady=(4, 0))
+
+    def open_circular_path_window(self):
+        if self.circular_path_window is not None and self.circular_path_window.winfo_exists():
+            self.circular_path_window.lift()
+            self.circular_path_window.focus_force()
+            return
+        self.circular_path_window = CircularScanPathWindow(self)
 
     def build_limit_panel(self, parent):
         frame = ttk.LabelFrame(parent, text="Limit switches", padding=4)

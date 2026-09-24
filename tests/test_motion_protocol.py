@@ -23,6 +23,7 @@ if "serial" not in sys.modules:
 
 sys.path.insert(0, str(ROOT))
 from x_control import extract_complete_lines, parse_status_line  # noqa: E402
+from circular_scan_path import generate_circular_path  # noqa: E402
 
 
 class MotionProtocolTests(unittest.TestCase):
@@ -260,6 +261,32 @@ class MotionProtocolTests(unittest.TestCase):
         self.assertNotIn("run_cv", eis_ui)
         self.assertNotIn("run_ca", eis_ui)
 
+    def test_circular_scan_path_is_centered_clipped_and_serpentine(self):
+        points = generate_circular_path(10.0, -5.0, 4.0, 1.0)
+        self.assertEqual(len(points), 13)
+        self.assertEqual(points[0], {"index": 1, "x": 10.0, "y": -7.0})
+        self.assertEqual(points[-1], {"index": 13, "x": 10.0, "y": -3.0})
+        for expected_index, point in enumerate(points, start=1):
+            self.assertEqual(point["index"], expected_index)
+            self.assertLessEqual(
+                (point["x"] - 10.0) ** 2 + (point["y"] + 5.0) ** 2,
+                4.0 + 1e-10,
+            )
+        middle_row = [point["x"] for point in points if point["y"] == -5.0]
+        self.assertEqual(middle_row, [8.0, 9.0, 10.0, 11.0, 12.0])
+
+    def test_circular_scan_path_rejects_invalid_geometry(self):
+        for diameter, spacing in ((0.0, 1.0), (-1.0, 1.0), (2.0, 0.0), (2.0, -1.0)):
+            with self.assertRaises(ValueError):
+                generate_circular_path(0.0, 0.0, diameter, spacing)
+
+    def test_circular_scan_preview_has_separate_path_and_reference_diameters(self):
+        source = (ROOT / "circular_scan_path.py").read_text(encoding="utf-8")
+        self.assertIn("self.path_diameter_var = tk.DoubleVar(value=43.0)", source)
+        self.assertIn("self.reference_diameter_var = tk.DoubleVar(value=46.0)", source)
+        self.assertIn("Path circle: D=", source)
+        self.assertIn("Reference circle: D=", source)
+
     def test_python_sources_parse_on_python_37_grammar(self):
         for relative_path in (
             "x_control.py",
@@ -267,6 +294,7 @@ class MotionProtocolTests(unittest.TestCase):
             "gamry_ca_manual.py",
             "gamry_eis_manual.py",
             "pre_gamry_eis_getru_max.py",
+            "circular_scan_path.py",
             "tests/test_motion_protocol.py",
         ):
             source = (ROOT / relative_path).read_text(encoding="utf-8")
