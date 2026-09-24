@@ -352,6 +352,24 @@ class MotionProtocolTests(unittest.TestCase):
         self.assertIn('Serial.println(F("ERROR,BAD_LIFT"))', firmware)
         self.assertIn('Serial.println(F("ERROR,BAD_LIFT_SPEED"))', firmware)
 
+    def test_xy_pump_cycle_stops_pump_before_lift_and_has_no_gamry(self):
+        source = (ROOT / "xy_pump_cycle.py").read_text(encoding="utf-8")
+        self.assertIn("self.pump_enabled_vars", source)
+        self.assertIn("self.pump_rpm_vars", source)
+        self.assertIn("self.pump_duration_vars", source)
+        self.assertIn("self.pressed_stabilization_var = tk.DoubleVar(value=1.0)", source)
+        self.assertIn("self.pre_lift_wait_var = tk.DoubleVar(value=1.0)", source)
+        self.assertIn('self.press_state = "stabilizing"', source)
+        self.assertIn("self._start_pumps", source)
+        self.assertIn('self.press_state = "pre_lift_wait"', source)
+        self.assertIn("self._start_lift_after_wait", source)
+        self.assertIn('"PUMP SPEED {} {:.2f}"', source)
+        self.assertIn('"PUMP START {}"', source)
+        self.assertIn('"PUMP STOP {}"', source)
+        self.assertIn("if self.running_pumps:", source)
+        self.assertLess(source.index("self._stop_pump(pump_id)"), source.index('self.press_state = "lifting"'))
+        self.assertNotIn("gamry_pstat", source)
+
     def test_python_sources_parse_on_python_37_grammar(self):
         for relative_path in (
             "x_control.py",
@@ -363,6 +381,7 @@ class MotionProtocolTests(unittest.TestCase):
             "rectangular_scan_path.py",
             "xy_dry_run.py",
             "xy_press_cycle.py",
+            "xy_pump_cycle.py",
             "tests/test_motion_protocol.py",
         ):
             source = (ROOT / relative_path).read_text(encoding="utf-8")

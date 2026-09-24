@@ -57,7 +57,10 @@ def generate_rectangular_path(
 class RectangularScanPathWindow(tk.Toplevel):
     """Generate, inspect, plot, and export a rectangular path without motion."""
 
-    def __init__(self, parent, dry_run_callback=None, press_cycle_callback=None):
+    def __init__(
+        self, parent, dry_run_callback=None, press_cycle_callback=None,
+        pump_cycle_callback=None
+    ):
         tk.Toplevel.__init__(self, parent)
         self.title("Rectangular scan path — preview only")
         self.geometry("1040x680")
@@ -76,6 +79,7 @@ class RectangularScanPathWindow(tk.Toplevel):
         self.points = []
         self.dry_run_callback = dry_run_callback
         self.press_cycle_callback = press_cycle_callback
+        self.pump_cycle_callback = pump_cycle_callback
         self._build_ui()
 
     def _build_ui(self):
@@ -122,6 +126,10 @@ class RectangularScanPathWindow(tk.Toplevel):
             controls, text="PRESS CYCLE", command=self.start_press_cycle, state="disabled"
         )
         self.press_cycle_button.grid(row=3, column=7, padx=4)
+        self.pump_cycle_button = ttk.Button(
+            controls, text="PUMP CYCLE", command=self.start_pump_cycle, state="disabled"
+        )
+        self.pump_cycle_button.grid(row=4, column=7, padx=4)
         ttk.Label(controls, textvariable=self.summary_var).grid(
             row=3, column=0, columnspan=8, sticky="w", pady=(6, 0)
         )
@@ -250,6 +258,8 @@ class RectangularScanPathWindow(tk.Toplevel):
             self.dry_run_button.configure(state="normal")
         if self.press_cycle_callback is not None:
             self.press_cycle_button.configure(state="normal")
+        if self.pump_cycle_callback is not None:
+            self.pump_cycle_button.configure(state="normal")
 
     def start_dry_run(self):
         if self.points and self.dry_run_callback is not None:
@@ -258,6 +268,10 @@ class RectangularScanPathWindow(tk.Toplevel):
     def start_press_cycle(self):
         if self.points and self.press_cycle_callback is not None:
             self.press_cycle_callback(self.points, "Rectangular path")
+
+    def start_pump_cycle(self):
+        if self.points and self.pump_cycle_callback is not None:
+            self.pump_cycle_callback(self.points, "Rectangular path")
 
     def export_csv(self):
         if not self.points:
