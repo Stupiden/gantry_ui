@@ -123,6 +123,11 @@ class MotionProtocolTests(unittest.TestCase):
         self.assertIn("MODE_HOME", firmware)
         self.assertIn('strcmp(verb, "HOME")', firmware)
         self.assertIn("axis->positionSteps = 0", firmware)
+        self.assertIn("bool homeMovementAllowed", firmware)
+        self.assertIn("if (axis.name == 'Z') return !limitTriggered(Z_PLUS)", firmware)
+        self.assertIn("int8_t homeDirection = -1", firmware)
+        self.assertIn("const uint8_t Z_HOME_DIR_LEVEL = LOW", firmware)
+        self.assertIn("digitalWrite(Z_DIR, Z_HOME_DIR_LEVEL)", firmware)
         self.assertIn("scanZeroSteps", firmware)
         self.assertIn('strcmp(verb, "SCAN_ZERO")', firmware)
         self.assertIn('self.send_command("HOME {}".format(axis))', ui)
@@ -327,6 +332,26 @@ class MotionProtocolTests(unittest.TestCase):
         self.assertNotIn('"PUMP ', source)
         self.assertNotIn("gamry_pstat", source)
 
+    def test_xy_press_cycle_waits_for_force_stop_and_lift_done(self):
+        source = (ROOT / "xy_press_cycle.py").read_text(encoding="utf-8")
+        self.assertIn('"PRESS {:.2f} {:.3f} {:.3f}"', source)
+        self.assertIn('line.startswith("EVENT,PRESS_FORCE_STOP")', source)
+        self.assertIn("self.lift_speed_var = tk.DoubleVar(value=2.0)", source)
+        self.assertIn('"LIFT {:.3f} {:.3f}".format(', source)
+        self.assertIn('line == "EVENT,LIFT_DONE"', source)
+        self.assertIn("maximum press travel reached", source)
+        self.assertNotIn('"PUMP ', source)
+        self.assertNotIn("gamry_pstat", source)
+        firmware = (
+            ROOT / "mega_x_controller" / "mega_x_controller.ino"
+        ).read_text(encoding="utf-8")
+        self.assertIn(
+            "bool startLift(float requestedLiftMM = 0.0f, float requestedLiftSpeed = 0.0f)",
+            firmware,
+        )
+        self.assertIn('Serial.println(F("ERROR,BAD_LIFT"))', firmware)
+        self.assertIn('Serial.println(F("ERROR,BAD_LIFT_SPEED"))', firmware)
+
     def test_python_sources_parse_on_python_37_grammar(self):
         for relative_path in (
             "x_control.py",
@@ -337,6 +362,7 @@ class MotionProtocolTests(unittest.TestCase):
             "circular_scan_path.py",
             "rectangular_scan_path.py",
             "xy_dry_run.py",
+            "xy_press_cycle.py",
             "tests/test_motion_protocol.py",
         ):
             source = (ROOT / relative_path).read_text(encoding="utf-8")

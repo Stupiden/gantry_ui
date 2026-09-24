@@ -2,7 +2,8 @@
   Milestone 6: Arduino Mega force-limited Z press and lift.
 
   Scope: position reporting, jog, relative move, immediate software STOP,
-  six limit inputs, dual-Y synchronized STEP pulses, homing to MINUS limits,
+  six limit inputs, dual-Y synchronized STEP pulses, X/Y homing to MINUS and
+  Z homing to PLUS,
   independent machine/scan coordinates, dual-Y driver alarm interlock,
   two fixed-direction peristaltic pumps, non-blocking ADS1220 force reading,
   force-limited Z press/lift, and a serial watchdog.
@@ -41,6 +42,8 @@ const uint8_t ADS1220_CS = 53;
 const float STEPS_PER_MM = 160.0f;
 const float DEFAULT_SPEED_MM_S = 2.0f;
 const float HOME_SPEED_MM_S = 1.0f;
+// Confirmed at the machine for Z homing: LOW travels upward toward Z+.
+const uint8_t Z_HOME_DIR_LEVEL = LOW;
 const float MIN_SPEED_MM_S = 0.05f;
 const float MAX_SPEED_MM_S = 5.0f;
 const unsigned int DIR_SETUP_US = 20;
@@ -275,6 +278,14 @@ bool movementAllowed(const AxisState &axis, int8_t direction) {
   return direction > 0 ? !limitTriggered(Z_PLUS) : !limitTriggered(Z_MINUS);
 }
 
+bool homeMovementAllowed(const AxisState &axis) {
+  // Z home travels in the physical upward direction (-1), but its home
+  // sensor is wired/named Z_PLUS.  Do not infer the home sensor from the
+  // movement sign for Z.
+  if (axis.name == 'Z') return !limitTriggered(Z_PLUS);
+  return movementAllowed(axis, -1);
+}
+
 const char *activeLimitName(const AxisState &axis, int8_t direction) {
   if (axis.name == 'X') return direction > 0 ? "XPLUS" : "XMIN";
   if (axis.name == 'Y') return direction > 0 ? "YPLUS" : "YMIN";
@@ -369,7 +380,7 @@ bool startPress(float forceThresholdG, float maxTravelMM,
   return true;
 }
 
-bool startLift() {
+bool startLift(float requestedLiftMM = 0.0f, float requestedLiftSpeed = 0.0f) {
   if (!pressCanLift || pressLiftSteps == 0) {
     Serial.println(F("ERROR,NO_PRESS_TO_LIFT"));
     return false;
@@ -380,11 +391,15 @@ bool startLift() {
   }
 
   unsigned long steps = pressLiftSteps;
+  if (requestedLiftMM > 0.0f) {
+    steps = static_cast<unsigned long>(lround(requestedLiftMM * STEPS_PER_MM));
+  }
   stopAll();
   pressCanLift = false;
   zAxis.direction = 1;
   zAxis.remainingSteps = steps;
-  zAxis.periodTicks = timerPeriodForSpeed(pressSpeedMM);
+  float liftSpeed = requestedLiftSpeed > 0.0f ? requestedLiftSpeed : pressSpeedMM;
+  zAxis.periodTicks = timerPeriodForSpeed(liftSpeed);
   setAxisDirection(zAxis, 1);
   delayMicroseconds(DIR_SETUP_US);
   zAxis.mode = MODE_LIFT;
@@ -537,16 +552,24 @@ bool startHome(AxisState &axis) {
   stopAll();
   if (axis.name == 'Z') pressCanLift = false;
 
-  // An axis already resting on its MINUS switch is at machine zero.
-  if (!movementAllowed(axis, -1)) {
+  // All home motion uses the physical upward/minus motor direction.  X/Y stop
+  // on MINUS; Z stops on its separately mapped Z_PLUS home sensor.
+  int8_t homeDirection = -1;
+  if (!homeMovementAllowed(axis)) {
     axis.positionSteps = 0;
     axis.homed = true;
     return false;
   }
 
-  axis.direction = -1;
+  axis.direction = homeDirection;
   axis.periodTicks = timerPeriodForSpeed(HOME_SPEED_MM_S);
-  setAxisDirection(axis, -1);
+  if (axis.name == 'Z') {
+    // Z home has a dedicated physical direction.  Keep this explicit instead
+    // of deriving it from the normal jog/press coordinate convention.
+    digitalWrite(Z_DIR, Z_HOME_DIR_LEVEL);
+  } else {
+    setAxisDirection(axis, homeDirection);
+  }
   delayMicroseconds(DIR_SETUP_US);
   axis.mode = MODE_HOME;
   startTimer(axis);
@@ -795,7 +818,24 @@ void processCommand(char *command) {
     return;
   }
   if (strcmp(verb, "LIFT") == 0) {
-    if (startLift()) {
+    char *liftToken = strtok_r(NULL, " ", &savePointer);
+    char *liftSpeedToken = strtok_r(NULL, " ", &savePointer);
+    float requestedLiftMM = 0.0f;
+    float requestedLiftSpeed = 0.0f;
+    if (liftToken != NULL &&
+        (!parseFloatStrict(liftToken, requestedLiftMM) ||
+         requestedLiftMM < 0.0f || requestedLiftMM > MAX_PRESS_TRAVEL_MM)) {
+      Serial.println(F("ERROR,BAD_LIFT"));
+      return;
+    }
+    if (liftSpeedToken != NULL &&
+        (!parseFloatStrict(liftSpeedToken, requestedLiftSpeed) ||
+         requestedLiftSpeed < MIN_SPEED_MM_S ||
+         requestedLiftSpeed > MAX_SPEED_MM_S)) {
+      Serial.println(F("ERROR,BAD_LIFT_SPEED"));
+      return;
+    }
+    if (startLift(requestedLiftMM, requestedLiftSpeed)) {
       Serial.println(F("OK,LIFT_STARTED"));
       sendStatus(true);
     }
@@ -1055,10 +1095,18 @@ void loop() {
     axis = NULL;
   }
 
-  if (axis != NULL && !movementAllowed(*axis, axis->direction)) {
+  bool axisMovementAllowed =
+      axis == NULL ? true
+                   : (axis->mode == MODE_HOME
+                          ? homeMovementAllowed(*axis)
+                          : movementAllowed(*axis, axis->direction));
+  if (axis != NULL && !axisMovementAllowed) {
     char axisName = axis->name;
     MotionMode stoppedMode = axis->mode;
-    const char *limitName = activeLimitName(*axis, axis->direction);
+    const char *limitName =
+        (stoppedMode == MODE_HOME && axis->name == 'Z')
+            ? "ZPLUS"
+            : activeLimitName(*axis, axis->direction);
     stopAll();
     if (stoppedMode == MODE_PRESS) capturePressLiftDistance();
     if (stoppedMode == MODE_HOME) {

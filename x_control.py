@@ -15,6 +15,7 @@ from gamry_eis_manual import ManualEISWindow
 from circular_scan_path import CircularScanPathWindow
 from rectangular_scan_path import RectangularScanPathWindow
 from xy_dry_run import XYDryRunWindow
+from xy_press_cycle import XYPressCycleWindow
 
 try:
     import toolkitpy as tkp
@@ -141,6 +142,7 @@ class GantryMotionUI(tk.Tk):
         self.circular_path_window = None
         self.rectangular_path_window = None
         self.xy_dry_run_window = None
+        self.xy_press_cycle_window = None
         self.gamry_measurement_owner = None
 
         self.port_var = tk.StringVar()
@@ -629,18 +631,34 @@ class GantryMotionUI(tk.Tk):
             self.circular_path_window.lift()
             self.circular_path_window.focus_force()
             return
-        self.circular_path_window = CircularScanPathWindow(self, self.open_xy_dry_run)
+        self.circular_path_window = CircularScanPathWindow(
+            self, self.open_xy_dry_run, self.open_xy_press_cycle
+        )
 
     def open_rectangular_path_window(self):
         if self.rectangular_path_window is not None and self.rectangular_path_window.winfo_exists():
             self.rectangular_path_window.lift()
             self.rectangular_path_window.focus_force()
             return
-        self.rectangular_path_window = RectangularScanPathWindow(self, self.open_xy_dry_run)
+        self.rectangular_path_window = RectangularScanPathWindow(
+            self, self.open_xy_dry_run, self.open_xy_press_cycle
+        )
 
     def xy_dry_run_guard(self):
         if not self.controller_ready:
             return False, "Connect the Mega controller first"
+        if (
+            self.xy_dry_run_window is not None
+            and self.xy_dry_run_window.winfo_exists()
+            and self.xy_dry_run_window.running
+        ):
+            return False, "An XY dry run is already running"
+        if (
+            self.xy_press_cycle_window is not None
+            and self.xy_press_cycle_window.winfo_exists()
+            and self.xy_press_cycle_window.running
+        ):
+            return False, "An XY press cycle is already running"
         if self.homed_vars["X"].get() != "HOMED" or self.homed_vars["Y"].get() != "HOMED":
             return False, "Home X and Y before an automated dry run"
         if any(value.get() != "STOPPED" for value in self.pump_status_vars):
@@ -666,6 +684,18 @@ class GantryMotionUI(tk.Tk):
                 return
             self.xy_dry_run_window.destroy()
         self.xy_dry_run_window = XYDryRunWindow(
+            self, points, path_name, self.send_command, self.current_scan_xy,
+            self.xy_dry_run_guard, self.lock_for_xy_dry_run,
+        )
+
+    def open_xy_press_cycle(self, points, path_name):
+        if self.xy_press_cycle_window is not None and self.xy_press_cycle_window.winfo_exists():
+            if self.xy_press_cycle_window.running:
+                self.xy_press_cycle_window.lift()
+                self.xy_press_cycle_window.focus_force()
+                return
+            self.xy_press_cycle_window.destroy()
+        self.xy_press_cycle_window = XYPressCycleWindow(
             self, points, path_name, self.send_command, self.current_scan_xy,
             self.xy_dry_run_guard, self.lock_for_xy_dry_run,
         )
@@ -917,6 +947,8 @@ class GantryMotionUI(tk.Tk):
     def disconnect_serial(self, reason):
         if self.xy_dry_run_window is not None and self.xy_dry_run_window.winfo_exists():
             self.xy_dry_run_window.emergency_stopped()
+        if self.xy_press_cycle_window is not None and self.xy_press_cycle_window.winfo_exists():
+            self.xy_press_cycle_window.emergency_stopped()
         if self.is_serial_open():
             try:
                 self.send_command("STOP", require_ready=False)
@@ -1034,6 +1066,8 @@ class GantryMotionUI(tk.Tk):
         if line.startswith("EVENT,") or line.startswith("ERROR,"):
             if self.xy_dry_run_window is not None and self.xy_dry_run_window.winfo_exists():
                 self.xy_dry_run_window.handle_controller_line(line)
+            if self.xy_press_cycle_window is not None and self.xy_press_cycle_window.winfo_exists():
+                self.xy_press_cycle_window.handle_controller_line(line)
             self.status_var.set(line)
             if line.startswith("EVENT,PRESS_FORCE_STOP"):
                 self.press_status_var.set("STOPPED — FORCE THRESHOLD")
@@ -1127,6 +1161,8 @@ class GantryMotionUI(tk.Tk):
                     self.press_status_var.set("IDLE")
             if self.xy_dry_run_window is not None and self.xy_dry_run_window.winfo_exists():
                 self.xy_dry_run_window.handle_status(values)
+            if self.xy_press_cycle_window is not None and self.xy_press_cycle_window.winfo_exists():
+                self.xy_press_cycle_window.handle_status(values)
         except (KeyError, ValueError):
             self.status_var.set("Invalid STATUS: {}".format(line))
 
@@ -1273,6 +1309,8 @@ class GantryMotionUI(tk.Tk):
     def emergency_stop(self):
         if self.xy_dry_run_window is not None and self.xy_dry_run_window.winfo_exists():
             self.xy_dry_run_window.emergency_stopped()
+        if self.xy_press_cycle_window is not None and self.xy_press_cycle_window.winfo_exists():
+            self.xy_press_cycle_window.emergency_stopped()
         if self.cv_window is not None and self.cv_window.winfo_exists():
             self.cv_window.stop_cv()
         if self.ca_window is not None and self.ca_window.winfo_exists():
@@ -1286,6 +1324,8 @@ class GantryMotionUI(tk.Tk):
     def on_close(self):
         if self.xy_dry_run_window is not None and self.xy_dry_run_window.winfo_exists():
             self.xy_dry_run_window.stop()
+        if self.xy_press_cycle_window is not None and self.xy_press_cycle_window.winfo_exists():
+            self.xy_press_cycle_window.stop()
         if self.eis_window is not None and self.eis_window.winfo_exists():
             if self.eis_window.running:
                 self.eis_window.close_pending = True
