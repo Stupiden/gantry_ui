@@ -11,6 +11,7 @@ import serial.tools.list_ports
 
 from gamry_cv_manual import ManualCVWindow
 from gamry_ca_manual import ManualCAWindow
+from gamry_eis_manual import ManualEISWindow
 
 try:
     import toolkitpy as tkp
@@ -133,6 +134,7 @@ class GantryMotionUI(tk.Tk):
         self.gamry_toolkit_initialized = False
         self.cv_window = None
         self.ca_window = None
+        self.eis_window = None
         self.gamry_measurement_owner = None
 
         self.port_var = tk.StringVar()
@@ -271,6 +273,10 @@ class GantryMotionUI(tk.Tk):
             frame, text="MANUAL CA", command=self.open_ca_window, state="disabled"
         )
         self.ca_button.grid(row=1, column=6, padx=(5, 0), pady=(3, 0))
+        self.eis_button = ttk.Button(
+            frame, text="MANUAL EIS", command=self.open_eis_window, state="disabled"
+        )
+        self.eis_button.grid(row=1, column=7, padx=(5, 0), pady=(3, 0))
 
     def ensure_gamry_environment(self):
         if tkp is None:
@@ -346,6 +352,7 @@ class GantryMotionUI(tk.Tk):
         self.gamry_device_box.configure(state="disabled")
         self.cv_button.configure(state="normal")
         self.ca_button.configure(state="normal")
+        self.eis_button.configure(state="normal")
         self.gamry_status_var.set("● CONNECTED")
         self.gamry_status_label.configure(fg="#187a2f")
         self.status_var.set("Gamry connected: PSTAT")
@@ -356,6 +363,9 @@ class GantryMotionUI(tk.Tk):
             return
         if self.ca_window is not None and self.ca_window.running:
             self.status_var.set("Stop CA before disconnecting Gamry")
+            return
+        if self.eis_window is not None and self.eis_window.running:
+            self.status_var.set("Stop EIS before disconnecting Gamry")
             return
         if self.gamry_pstat is not None:
             try:
@@ -372,6 +382,7 @@ class GantryMotionUI(tk.Tk):
         self.gamry_device_box.configure(state="readonly")
         self.cv_button.configure(state="disabled")
         self.ca_button.configure(state="disabled")
+        self.eis_button.configure(state="disabled")
         self.gamry_status_var.set("● DISCONNECTED")
         self.gamry_status_label.configure(fg="#666666")
 
@@ -411,6 +422,22 @@ class GantryMotionUI(tk.Tk):
             self,
             self.gamry_pstat,
             tkp,
+            self.current_machine_position,
+            self.claim_gamry_measurement,
+            self.release_gamry_measurement,
+        )
+
+    def open_eis_window(self):
+        if self.gamry_pstat is None:
+            self.status_var.set("Connect Gamry before opening manual EIS")
+            return
+        if self.eis_window is not None and self.eis_window.winfo_exists():
+            self.eis_window.lift()
+            self.eis_window.focus_force()
+            return
+        self.eis_window = ManualEISWindow(
+            self,
+            self.gamry_pstat,
             self.current_machine_position,
             self.claim_gamry_measurement,
             self.release_gamry_measurement,
@@ -1168,15 +1195,26 @@ class GantryMotionUI(tk.Tk):
             self.cv_window.stop_cv()
         if self.ca_window is not None and self.ca_window.winfo_exists():
             self.ca_window.stop_ca()
+        if self.eis_window is not None and self.eis_window.winfo_exists():
+            self.eis_window.stop_eis()
         self.send_command("STOP", require_ready=False)
         self.jog_axis = None
         self.status_var.set("STOP sent")
 
     def on_close(self):
+        if self.eis_window is not None and self.eis_window.winfo_exists():
+            if self.eis_window.running:
+                self.eis_window.close_pending = True
+                self.eis_window.stop_eis()
+                self.status_var.set("Waiting for EIS to stop safely before closing")
+                self.after(250, self.on_close)
+                return
         if self.cv_window is not None and self.cv_window.winfo_exists():
             self.cv_window.shutdown()
         if self.ca_window is not None and self.ca_window.winfo_exists():
             self.ca_window.shutdown()
+        if self.eis_window is not None and self.eis_window.winfo_exists():
+            self.eis_window.shutdown()
         if self.gamry_pstat is not None:
             self.disconnect_gamry()
         if self.gamry_toolkit_initialized:

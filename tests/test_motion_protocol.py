@@ -240,11 +240,33 @@ class MotionProtocolTests(unittest.TestCase):
         self.assertIn("self.gamry_measurement_owner", ui)
         self.assertNotIn("GamryEIS", ca)
 
+    def test_manual_eis_getru_uses_verified_engine_and_is_independent(self):
+        ui = (ROOT / "x_control.py").read_text(encoding="utf-8")
+        eis_ui = (ROOT / "gamry_eis_manual.py").read_text(encoding="utf-8")
+        engine = (ROOT / "pre_gamry_eis_getru_max.py").read_text(encoding="utf-8")
+        self.assertIn("ManualEISWindow", ui)
+        self.assertIn("GamryEIS", eis_ui)
+        self.assertIn("DEFAULT_FREQUENCIES", eis_ui)
+        self.assertIn("self.dc_bias_var = tk.DoubleVar(value=0.0)", eis_ui)
+        self.assertIn("self.ac_amplitude_var = tk.DoubleVar(value=0.007)", eis_ui)
+        self.assertIn("self.zmod_var = tk.DoubleVar(value=40.0)", eis_ui)
+        self.assertIn("self.max_phase_var = tk.DoubleVar(value=7.5)", eis_ui)
+        self.assertIn("self.repeats_var = tk.IntVar(value=3)", eis_ui)
+        self.assertIn("self.passes_var = tk.IntVar(value=10)", eis_ui)
+        self.assertIn("self.gamry_measurement_owner", ui)
+        self.assertIn("class EISContactError", engine)
+        self.assertIn("def run_eis", engine)
+        self.assertIn("GetRu accepted", engine)
+        self.assertNotIn("run_cv", eis_ui)
+        self.assertNotIn("run_ca", eis_ui)
+
     def test_python_sources_parse_on_python_37_grammar(self):
         for relative_path in (
             "x_control.py",
             "gamry_cv_manual.py",
             "gamry_ca_manual.py",
+            "gamry_eis_manual.py",
+            "pre_gamry_eis_getru_max.py",
             "tests/test_motion_protocol.py",
         ):
             source = (ROOT / relative_path).read_text(encoding="utf-8")
