@@ -78,6 +78,8 @@ class CircularScanPathWindow(tk.Toplevel):
         self.spacing_var = tk.DoubleVar(value=2.0)
         self.summary_var = tk.StringVar(value="No path generated")
         self.points = []
+        self.path_line = None
+        self.hover_annotation = None
         self.dry_run_callback = dry_run_callback
         self.press_cycle_callback = press_cycle_callback
         self.pump_cycle_callback = pump_cycle_callback
@@ -164,6 +166,7 @@ class CircularScanPathWindow(tk.Toplevel):
         self.axes.set_aspect("equal", adjustable="box")
         self.canvas = FigureCanvasTkAgg(figure, master=plot_frame)
         self.canvas.get_tk_widget().grid(row=0, column=0, sticky="nsew")
+        self.canvas.mpl_connect("motion_notify_event", self._on_plot_hover)
 
         content.add(table_frame, weight=1)
         content.add(plot_frame, weight=2)
@@ -200,6 +203,8 @@ class CircularScanPathWindow(tk.Toplevel):
         path_radius = path_diameter / 2.0
         reference_radius = reference_diameter / 2.0
         self.axes.clear()
+        self.path_line = None
+        self.hover_annotation = None
         self.axes.set_xlabel("Scan X / mm")
         self.axes.set_ylabel("Scan Y / mm")
         self.axes.grid(True)
@@ -221,14 +226,23 @@ class CircularScanPathWindow(tk.Toplevel):
         if points:
             x_values = [point["x"] for point in points]
             y_values = [point["y"] for point in points]
-            self.axes.plot(x_values, y_values, "o-", markersize=3, linewidth=0.8)
+            self.path_line, = self.axes.plot(
+                x_values, y_values, "o-", markersize=5, linewidth=0.8, picker=5
+            )
             self.axes.plot(x_values[0], y_values[0], "o", color="green", markersize=7)
             self.axes.plot(x_values[-1], y_values[-1], "s", color="red", markersize=6)
+            self.hover_annotation = self.axes.annotate(
+                "", xy=(0.0, 0.0), xytext=(8, 8), textcoords="offset points",
+                bbox=dict(boxstyle="round", fc="white", ec="0.4", alpha=0.95),
+                arrowprops=dict(arrowstyle="->", color="0.35"), zorder=10,
+            )
+            self.hover_annotation.set_visible(False)
         self.axes.legend(loc="best", fontsize=8)
         display_radius = max(path_radius, reference_radius)
         margin = max(display_radius * 0.08, 0.5)
         self.axes.set_xlim(center_x - display_radius - margin, center_x + display_radius + margin)
         self.axes.set_ylim(center_y - display_radius - margin, center_y + display_radius + margin)
+        self.axes.invert_yaxis()
         self.canvas.draw_idle()
 
         self.summary_var.set(
@@ -245,6 +259,26 @@ class CircularScanPathWindow(tk.Toplevel):
             self.pump_cycle_button.configure(state="normal")
         if self.full_cv_callback is not None:
             self.full_cv_button.configure(state="normal")
+
+    def _on_plot_hover(self, event):
+        if self.path_line is None or self.hover_annotation is None:
+            return
+        visible = False
+        if event.inaxes is self.axes:
+            contains, details = self.path_line.contains(event)
+            indices = details.get("ind", ()) if contains else ()
+            if indices:
+                point = self.points[int(indices[0])]
+                self.hover_annotation.xy = (point["x"], point["y"])
+                self.hover_annotation.set_text(
+                    "Index {}\nX={:.3f}, Y={:.3f}".format(
+                        point["index"], point["x"], point["y"]
+                    )
+                )
+                visible = True
+        if self.hover_annotation.get_visible() != visible:
+            self.hover_annotation.set_visible(visible)
+            self.canvas.draw_idle()
 
     def start_dry_run(self):
         if self.points and self.dry_run_callback is not None:

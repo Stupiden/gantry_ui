@@ -322,6 +322,14 @@ class MotionProtocolTests(unittest.TestCase):
         self.assertIn('label="Path:', source)
         self.assertIn('label="Reference:', source)
 
+    def test_scan_previews_have_hover_index_and_operator_view(self):
+        for filename in ("circular_scan_path.py", "rectangular_scan_path.py"):
+            source = (ROOT / filename).read_text(encoding="utf-8")
+            self.assertIn('mpl_connect("motion_notify_event", self._on_plot_hover)', source)
+            self.assertIn('"Index {}\\nX={:.3f}, Y={:.3f}"', source)
+            self.assertIn("self.axes.invert_yaxis()", source)
+            self.assertNotIn("Operator view", source)
+
     def test_xy_dry_run_is_xy_only_and_waits_for_move_done(self):
         source = (ROOT / "xy_dry_run.py").read_text(encoding="utf-8")
         self.assertIn('"MOVE {} {:.3f}".format(axis, delta)', source)
