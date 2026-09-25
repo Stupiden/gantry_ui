@@ -8,6 +8,7 @@ from tkinter import filedialog, messagebox, ttk
 
 from auto_cv_measurement import AutoCVMeasurement
 from automatic_live_plot import AutomaticLivePlot
+from experiment_data import ExperimentDataManager
 from xy_pump_cycle import XYPumpCycleWindow
 
 
@@ -119,6 +120,10 @@ class XYFullCVCycleWindow(XYPumpCycleWindow):
         XYPumpCycleWindow.start(self)
         if not self.running:
             return
+        self.data_manager = ExperimentDataManager(
+            self.output_dir, "CV", self.path_name, self.points,
+            self._manifest_settings(self.cv_params)
+        )
         if self.claim_measurement is not None:
             if not self.claim_measurement("AUTO_CV"):
                 XYPumpCycleWindow.stop(self)
@@ -163,7 +168,7 @@ class XYFullCVCycleWindow(XYPumpCycleWindow):
             self.after_id = self.after(100, self._wait_for_pumps_before_cv)
             return
         self.pump_start_deadline = None
-        self._start_cv()
+        self._hold_with_pumps_before(self._start_cv, "CV")
 
     def _start_cv(self):
         point = self._current_target()
@@ -171,16 +176,18 @@ class XYFullCVCycleWindow(XYPumpCycleWindow):
         filename = "CV_point_{:04d}_x{:+.3f}_y{:+.3f}_{}.csv".format(
             int(point["index"]), float(point["x"]), float(point["y"]), stamp
         )
+        attempt_dir = self.data_manager.active_folder
         self.press_state = "measuring_cv"
         self.live_plot.deiconify()
         self.live_plot.clear_cv()
         self.status_var.set("CV RUNNING AT POINT {} — pumps ON — cell ON".format(point["index"]))
         try:
             self.cv_runner.start(
-                self.cv_params, self.output_dir / filename, point,
+                self.cv_params, attempt_dir / filename, point,
                 self.machine_position_provider(), self._cv_complete, self._cv_error,
                 self.live_plot.update_cv,
             )
+            self._restore_measurement_pumps()
         except Exception as error:
             self._cv_error(error)
 

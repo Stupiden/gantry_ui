@@ -756,8 +756,6 @@ class GantryMotionUI(tk.Tk):
             return False, "An EIS + compensated CV cycle is already running"
         if self.xy_full_ca_window is not None and self.xy_full_ca_window.winfo_exists() and self.xy_full_ca_window.running:
             return False, "A full CA cycle is already running"
-        if self.homed_vars["X"].get() != "HOMED" or self.homed_vars["Y"].get() != "HOMED":
-            return False, "Home X and Y before an automated dry run"
         if any(value.get() != "STOPPED" for value in self.pump_status_vars):
             return False, "Stop both pumps before an XY dry run"
         if self.gamry_measurement_owner is not None:

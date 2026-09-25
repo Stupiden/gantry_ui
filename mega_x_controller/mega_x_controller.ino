@@ -75,6 +75,10 @@ const float DEFAULT_PRESS_TRAVEL_MM = 20.0f;
 const float MAX_PRESS_TRAVEL_MM = 50.0f;
 const unsigned long STATUS_INTERVAL_MS = 100;
 const unsigned long COMMAND_WATCHDOG_MS = 750;
+// Gamry EIS calls can hold Python's GIL for several seconds.  Keep the fast
+// motion watchdog, but give explicitly started pumps a separate lease so they
+// remain continuous throughout a measurement.  A lost UI still stops them.
+const unsigned long PUMP_WATCHDOG_MS = 30000;
 const size_t COMMAND_BUFFER_SIZE = 96;
 
 enum MotionMode {
@@ -1129,13 +1133,17 @@ void loop() {
     sendStatus(true);
   }
 
-  if ((anyAxisMoving() || anyPumpRunning()) &&
-      millis() - lastCommandMillis > COMMAND_WATCHDOG_MS) {
+  if (anyAxisMoving() && millis() - lastCommandMillis > COMMAND_WATCHDOG_MS) {
     bool wasPressing = zAxis.mode == MODE_PRESS;
     stopAll();
     if (wasPressing) capturePressLiftDistance();
-    stopAllPumps();
     Serial.println(F("EVENT,WATCHDOG_STOP"));
+    sendStatus(true);
+  }
+
+  if (anyPumpRunning() && millis() - lastCommandMillis > PUMP_WATCHDOG_MS) {
+    stopAllPumps();
+    Serial.println(F("EVENT,PUMP_WATCHDOG_STOP"));
     sendStatus(true);
   }
 

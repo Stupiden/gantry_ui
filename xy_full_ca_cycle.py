@@ -8,6 +8,7 @@ from tkinter import filedialog, messagebox, ttk
 
 from auto_ca_measurement import AutoCAMeasurement
 from automatic_live_plot import AutomaticLivePlot
+from experiment_data import ExperimentDataManager
 from xy_pump_cycle import XYPumpCycleWindow
 
 
@@ -85,6 +86,10 @@ class XYFullCACycleWindow(XYPumpCycleWindow):
             messagebox.showerror("Full CA cycle", str(error), parent=self); return
         XYPumpCycleWindow.start(self)
         if not self.running: return
+        self.data_manager = ExperimentDataManager(
+            self.output_dir, "CA", self.path_name, self.points,
+            self._manifest_settings(self.ca_params)
+        )
         if self.claim_measurement is not None and not self.claim_measurement("AUTO_CA"):
             XYPumpCycleWindow.stop(self); return
         self.measurement_claimed = True
@@ -108,15 +113,18 @@ class XYFullCACycleWindow(XYPumpCycleWindow):
             if time.monotonic() >= self.pump_start_deadline:
                 self._finish("ABORTED — pumps not confirmed running; use manual LIFT"); return
             self.after_id = self.after(100, self._wait_pumps); return
-        self._start_ca()
+        self.pump_start_deadline = None
+        self._hold_with_pumps_before(self._start_ca, "CA")
 
     def _start_ca(self):
         point, stamp = self._current_target(), datetime.now().strftime("%Y%m%d_%H%M%S")
-        path = self.output_dir / "CA_point_{:04d}_{}.csv".format(int(point["index"]), stamp)
+        attempt_dir = self.data_manager.active_folder
+        path = attempt_dir / "CA_point_{:04d}_{}.csv".format(int(point["index"]), stamp)
         self.press_state = "measuring_ca"; self.live_plot.deiconify(); self.live_plot.clear_ca()
         try:
             self.ca_runner.start(self.ca_params, path, point, self.machine_position_provider(),
                 self._ca_complete, self._ca_error, self.live_plot.update_ca)
+            self._restore_measurement_pumps()
         except Exception as error: self._ca_error(error)
 
     def handle_status(self, values):

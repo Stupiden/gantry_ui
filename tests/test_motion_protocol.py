@@ -1,6 +1,8 @@
 import ast
 import pathlib
+import json
 import sys
+import tempfile
 import types
 import unittest
 
@@ -23,6 +25,7 @@ if "serial" not in sys.modules:
 
 sys.path.insert(0, str(ROOT))
 from x_control import extract_complete_lines, parse_status_line  # noqa: E402
+from experiment_data import ExperimentDataManager  # noqa: E402
 from circular_scan_path import generate_circular_path  # noqa: E402
 from rectangular_scan_path import generate_rectangular_path  # noqa: E402
 
@@ -379,12 +382,14 @@ class MotionProtocolTests(unittest.TestCase):
     def test_xy_pump_cycle_stops_pump_before_lift_and_has_no_gamry(self):
         source = (ROOT / "xy_pump_cycle.py").read_text(encoding="utf-8")
         self.assertIn("self.pump_enabled_vars", source)
+        self.assertEqual(source.count("tk.BooleanVar(value=True)"), 2)
         self.assertIn("self.pump_rpm_vars", source)
         self.assertIn("self.pump_duration_vars", source)
         self.assertIn("self.pressed_stabilization_var = tk.DoubleVar(value=1.0)", source)
         self.assertIn("self.pre_lift_wait_var = tk.DoubleVar(value=1.0)", source)
-        self.assertIn('self.press_state = "stabilizing"', source)
+        self.assertIn('self.press_state = "stabilizing_with_pumps"', source)
         self.assertIn("self._start_pumps", source)
+        self.assertIn("def _hold_with_pumps_before", source)
         self.assertIn('self.press_state = "pre_lift_wait"', source)
         self.assertIn("self._start_lift_after_wait", source)
         self.assertIn('"PUMP SPEED {} {:.2f}"', source)
@@ -411,6 +416,31 @@ class MotionProtocolTests(unittest.TestCase):
         self.assertIn("self.pstat.set_cell(True)", runner)
         self.assertIn("self.pstat.set_cell(False)", runner)
         self.assertIn('"point_index", "scan_x_mm", "scan_y_mm"', runner)
+        self.assertIn("self._restore_measurement_pumps()", source)
+
+    def test_automatic_cycles_do_not_require_homing_and_restore_pumps_after_gamry_setup(self):
+        ui = (ROOT / "x_control.py").read_text(encoding="utf-8")
+        pump = (ROOT / "xy_pump_cycle.py").read_text(encoding="utf-8")
+        ca = (ROOT / "xy_full_ca_cycle.py").read_text(encoding="utf-8")
+        compensated = (ROOT / "xy_eis_comp_cv_cycle.py").read_text(encoding="utf-8")
+        self.assertNotIn("Home X and Y before an automated dry run", ui)
+        self.assertIn("def _restore_measurement_pumps", pump)
+        self.assertIn("self._restore_measurement_pumps()", ca)
+        self.assertIn("self._restore_measurement_pumps()", compensated)
+
+    def test_pumps_have_a_separate_watchdog_for_blocking_eis_calls(self):
+        firmware = (
+            ROOT / "mega_x_controller" / "mega_x_controller.ino"
+        ).read_text(encoding="utf-8")
+        self.assertIn("const unsigned long PUMP_WATCHDOG_MS = 30000;", firmware)
+        self.assertIn(
+            "if (anyAxisMoving() && millis() - lastCommandMillis > COMMAND_WATCHDOG_MS)",
+            firmware,
+        )
+        self.assertIn(
+            "if (anyPumpRunning() && millis() - lastCommandMillis > PUMP_WATCHDOG_MS)",
+            firmware,
+        )
 
     def test_full_eis_cycle_keeps_pumps_on_until_getru_finishes(self):
         source = (ROOT / "xy_full_eis_cycle.py").read_text(encoding="utf-8")
@@ -452,6 +482,18 @@ class MotionProtocolTests(unittest.TestCase):
         self.assertLess(source.index('"PUMP START {}"'), source.index("self.ca_runner.start("))
         self.assertIn("self._pump_time_complete(selected_id)", source)
 
+    def test_experiment_manifest_tracks_point_attempt_without_overwrite(self):
+        points = [{"index": 1, "x": 1.0, "y": -2.0}]
+        with tempfile.TemporaryDirectory() as folder:
+            manager = ExperimentDataManager(folder, "CV", "test path", points, {"scan": 0.1})
+            attempt = manager.begin_point(points[0])
+            self.assertEqual(attempt.name, "attempt_001")
+            manager.complete_point(1)
+            with open(str(manager.manifest_path), "r", encoding="utf-8") as stream:
+                manifest = json.load(stream)
+            self.assertEqual(manifest["points"][0]["status"], "completed")
+            self.assertEqual(manifest["points"][0]["attempts"][0]["status"], "completed")
+
     def test_python_sources_parse_on_python_37_grammar(self):
         for relative_path in (
             "x_control.py",
@@ -472,6 +514,7 @@ class MotionProtocolTests(unittest.TestCase):
             "xy_eis_comp_cv_cycle.py",
             "auto_ca_measurement.py",
             "xy_full_ca_cycle.py",
+            "experiment_data.py",
             "tests/test_motion_protocol.py",
         ):
             source = (ROOT / relative_path).read_text(encoding="utf-8")

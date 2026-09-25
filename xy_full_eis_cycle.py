@@ -9,6 +9,7 @@ from tkinter import filedialog, messagebox, ttk
 
 from auto_eis_measurement import AutoEISMeasurement
 from automatic_live_plot import AutomaticLivePlot
+from experiment_data import ExperimentDataManager
 from gamry_eis_manual import DEFAULT_FREQUENCIES
 from xy_pump_cycle import XYPumpCycleWindow
 
@@ -142,6 +143,10 @@ class XYFullEISCycleWindow(XYPumpCycleWindow):
         XYPumpCycleWindow.start(self)
         if not self.running:
             return
+        self.data_manager = ExperimentDataManager(
+            self.output_dir, self._experiment_method(), self.path_name,
+            self.points, self._manifest_settings(self._experiment_settings())
+        )
         if self.claim_measurement is not None:
             if not self.claim_measurement("AUTO_EIS"):
                 XYPumpCycleWindow.stop(self)
@@ -152,6 +157,12 @@ class XYFullEISCycleWindow(XYPumpCycleWindow):
             self.measurement_claimed = True
         for widget in self.eis_widgets:
             widget.configure(state="disabled")
+
+    def _experiment_method(self):
+        return "EIS_GetRu"
+
+    def _experiment_settings(self):
+        return self.eis_params
 
     def _start_pumps(self):
         self.after_id = None
@@ -183,7 +194,7 @@ class XYFullEISCycleWindow(XYPumpCycleWindow):
             self.after_id = self.after(100, self._wait_for_pumps_before_eis)
             return
         self.pump_start_deadline = None
-        self._start_eis()
+        self._hold_with_pumps_before(self._start_eis, "EIS")
 
     def _start_eis(self):
         point = self._current_target()
@@ -191,13 +202,14 @@ class XYFullEISCycleWindow(XYPumpCycleWindow):
         filename = "EIS_point_{:04d}_x{:+.3f}_y{:+.3f}_{}.csv".format(
             int(point["index"]), float(point["x"]), float(point["y"]), stamp
         )
+        self.active_attempt_dir = self.data_manager.active_folder
         self.press_state = "measuring_eis"
         self.live_plot.deiconify()
         self.live_plot.clear_eis()
         self.status_var.set("EIS RUNNING AT POINT {} — pumps ON".format(point["index"]))
         try:
             self.eis_runner.start(
-                self.eis_params, self.output_dir / filename, point,
+                self.eis_params, self.active_attempt_dir / filename, point,
                 self.machine_position_provider(), self._eis_complete, self._eis_error,
                 self.live_plot.update_eis_csv,
             )

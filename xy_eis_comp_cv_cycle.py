@@ -130,12 +130,25 @@ class XYEISCompCVCycleWindow(XYFullEISCycleWindow):
         self.live_plot.clear_cv()
         try:
             self.cv_runner.start(
-                params, self.output_dir / filename, point,
+                params, self.active_attempt_dir / filename, point,
                 self.machine_position_provider(), self._cv_complete, self._cv_error,
                 self.live_plot.update_cv,
             )
+            self._restore_measurement_pumps()
         except Exception as error:
             self._cv_error(error)
+
+    def _experiment_method(self):
+        return "EIS_GetRu_compensated_CV"
+
+    def _experiment_settings(self):
+        return {
+            "eis": self.eis_params,
+            "cv": self.cv_params,
+            "compensation_fraction": self.comp_fraction,
+            "min_ru_ohm": self.min_ru,
+            "max_ru_ohm": self.max_ru,
+        }
 
     def _cv_complete(self, point_count, csv_path):
         if not self.running:

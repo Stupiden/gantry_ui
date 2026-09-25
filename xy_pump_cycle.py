@@ -19,7 +19,7 @@ class XYPumpCycleWindow(XYPressCycleWindow):
         self.geometry("760x620")
         self.pump_enabled_vars = [
             tk.BooleanVar(value=True),
-            tk.BooleanVar(value=False),
+            tk.BooleanVar(value=True),
         ]
         self.pump_rpm_vars = [tk.DoubleVar(value=2.0), tk.DoubleVar(value=2.0)]
         self.pump_duration_vars = [tk.DoubleVar(value=2.0), tk.DoubleVar(value=2.0)]
@@ -101,6 +101,22 @@ class XYPumpCycleWindow(XYPressCycleWindow):
             raise ValueError("Pre-lift wait must be 0–3600 s")
         return configs, stabilization, pre_lift_wait
 
+    def _manifest_settings(self, measurement):
+        return {
+            "measurement": measurement,
+            "motion": {"speed_mm_s": float(self.speed_var.get()),
+                       "wait_at_point_s": float(self.dwell_var.get())},
+            "press": {"force_threshold_g": self.press_force,
+                      "max_travel_mm": self.press_travel,
+                      "speed_mm_s": self.press_speed,
+                      "lift_distance_mm": self.lift_distance,
+                      "lift_speed_mm_s": self.lift_speed},
+            "pumps": [{"pump_id": item[0], "speed_rpm": item[1],
+                       "post_measurement_s": item[2]} for item in self.pump_configs],
+            "pressed_stabilization_s": self.pressed_stabilization,
+            "pre_lift_wait_s": self.pre_lift_wait,
+        }
+
     def start(self):
         try:
             (
@@ -122,16 +138,11 @@ class XYPumpCycleWindow(XYPressCycleWindow):
         if not self.running:
             return
         if line.startswith("EVENT,PRESS_FORCE_STOP") and self.press_state == "pressing":
-            self.press_state = "stabilizing"
             point = self._current_target()
             self.status_var.set(
-                "FORCE REACHED — holding {:.3f} s at point {}".format(
-                    self.pressed_stabilization, point["index"]
-                )
+                "FORCE REACHED — starting pumps at point {}".format(point["index"])
             )
-            self.after_id = self.after(
-                int(self.pressed_stabilization * 1000), self._start_pumps
-            )
+            self._start_pumps()
             return
         XYPressCycleWindow.handle_controller_line(self, line)
 
@@ -150,10 +161,58 @@ class XYPumpCycleWindow(XYPressCycleWindow):
                 self._finish("FAILED — pump start command was not sent")
                 return
             self.running_pumps.add(pump_id)
+        self.press_state = "stabilizing_with_pumps"
+        self.status_var.set(
+            "PUMPS ON — refreshing electrolyte for {:.3f} s".format(
+                self.pressed_stabilization
+            )
+        )
+        self.after_id = self.after(
+            int(self.pressed_stabilization * 1000), self._start_pump_duration
+        )
+
+    def _start_pump_duration(self):
+        self.after_id = None
+        if not self.running:
+            return
+        self.press_state = "pumping"
+        for pump_id, unused_rpm, duration in self.pump_configs:
             self.pump_after_ids[pump_id] = self.after(
                 int(duration * 1000),
                 lambda selected_id=pump_id: self._pump_time_complete(selected_id),
             )
+
+    def _hold_with_pumps_before(self, callback, measurement_name):
+        self.press_state = "stabilizing_with_pumps"
+        self.status_var.set(
+            "PUMPS ON — refreshing electrolyte for {:.3f} s before {}".format(
+                self.pressed_stabilization, measurement_name
+            )
+        )
+        self.after_id = self.after(
+            int(self.pressed_stabilization * 1000), callback
+        )
+
+    def _restore_measurement_pumps(self):
+        """Restart selected pumps after a blocking Gamry setup call.
+
+        The Mega watchdog intentionally stops pumps if Tk cannot send a
+        keepalive for 750 ms.  Gamry CV/CA initialization can exceed that
+        interval, so restore the selected pumps immediately before the
+        non-blocking measurement loop continues.
+        """
+        for pump_id, rpm, unused_duration in self.pump_configs:
+            if not self.send_command("PUMP SPEED {} {:.2f}".format(pump_id, rpm)):
+                raise RuntimeError("pump speed command was not sent")
+            if not self.send_command("PUMP START {}".format(pump_id)):
+                raise RuntimeError("pump start command was not sent")
+            self.running_pumps.add(pump_id)
+
+    def _start_press(self):
+        manager = getattr(self, "data_manager", None)
+        if manager is not None and manager.active_index is None:
+            manager.begin_point(self._current_target())
+        XYPressCycleWindow._start_press(self)
 
     def _pump_time_complete(self, pump_id):
         self.pump_after_ids.pop(pump_id, None)
@@ -211,9 +270,18 @@ class XYPumpCycleWindow(XYPressCycleWindow):
         XYPressCycleWindow.emergency_stopped(self)
 
     def _finish(self, message):
+        manager = getattr(self, "data_manager", None)
+        if manager is not None and manager.active_index is not None:
+            manager.fail_active(message)
         if hasattr(self, "running_pumps"):
             self._stop_all_selected_pumps()
         XYPressCycleWindow._finish(self, message)
         if hasattr(self, "pump_widgets"):
             for widget in self.pump_widgets:
                 widget.configure(state="normal")
+
+    def _complete_pressed_point(self):
+        manager = getattr(self, "data_manager", None)
+        if manager is not None and manager.active_index is not None:
+            manager.complete_point(self._current_target()["index"])
+        XYPressCycleWindow._complete_pressed_point(self)
