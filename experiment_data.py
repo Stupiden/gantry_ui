@@ -34,8 +34,47 @@ class ExperimentDataManager:
         }
         self._save()
 
+    @classmethod
+    def from_manifest(cls, manifest_path):
+        path = Path(manifest_path)
+        with open(str(path), "r", encoding="utf-8") as stream:
+            data = json.load(stream)
+        manager = cls.__new__(cls)
+        manager.root = path.parent
+        manager.manifest_path = path
+        manager.active_index = None
+        manager.active_attempt = None
+        manager.active_folder = None
+        manager.data = data
+        return manager
+
+    def resumable_points(self):
+        return [dict(point) for point in self.data["points"] if point["status"] != "completed"]
+
+    def points_for_resume(self, mode, selected_indices=None):
+        if mode == "unfinished":
+            records = [point for point in self.data["points"] if point["status"] != "completed"]
+        elif mode == "all":
+            records = list(self.data["points"])
+        elif mode == "selected":
+            selected = {int(index) for index in (selected_indices or ())}
+            if not selected:
+                raise ValueError("Select at least one point to remeasure")
+            known = {int(point["index"]) for point in self.data["points"]}
+            if selected - known:
+                raise ValueError("Unknown selected point(s): {}".format(sorted(selected - known)))
+            records = [point for point in self.data["points"] if int(point["index"]) in selected]
+        else:
+            raise ValueError("Unknown resume mode '{}'".format(mode))
+        return [dict(point) for point in records]
+
     def begin_point(self, point):
         record = self._point(point["index"])
+        if record["status"] == "running" and record["attempts"]:
+            stale = record["attempts"][-1]
+            stale["status"] = "failed"
+            stale["finished_at"] = datetime.now().isoformat()
+            stale["reason"] = "INTERRUPTED BEFORE RESUME"
         attempt_number = len(record["attempts"]) + 1
         folder = self.root / "measurements" / "point_{:04d}".format(int(point["index"])) / "attempt_{:03d}".format(attempt_number)
         folder.mkdir(parents=True, exist_ok=False)

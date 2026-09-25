@@ -1,6 +1,7 @@
-"""Milestone 7: motion, force control, and Gamry connection status."""
+"""Gantry motion, fluidics, Gamry measurement, and scan automation UI."""
 
 import gc
+from pathlib import Path
 import sys
 import struct
 import time
@@ -15,6 +16,8 @@ from gamry_ca_manual import ManualCAWindow
 from gamry_eis_manual import ManualEISWindow
 from circular_scan_path import CircularScanPathWindow
 from rectangular_scan_path import RectangularScanPathWindow
+from experiment_resume_preview import choose_and_show_experiment
+from experiment_data import ExperimentDataManager
 from xy_dry_run import XYDryRunWindow
 from xy_press_cycle import XYPressCycleWindow
 from xy_pump_cycle import XYPumpCycleWindow
@@ -126,7 +129,7 @@ class GantryMotionUI(tk.Tk):
 
     def __init__(self):
         tk.Tk.__init__(self)
-        self.title("Gantry Motion Control — Milestone 7")
+        self.title("Gantry Measurement Automation")
         self.geometry("900x740")
         self.minsize(800, 680)
         self.option_add("*Font", ("Segoe UI", 9))
@@ -153,7 +156,12 @@ class GantryMotionUI(tk.Tk):
         self.xy_full_cv_window = None
         self.xy_full_eis_window = None
         self.xy_eis_cv_window = None
+        self.xy_resume_window = None
+        self.resume_serial_listeners = []
         self.xy_full_ca_window = None
+        self.automation_trace_path = Path(__file__).resolve().with_name(
+            "automation_trace.log"
+        )
         self.gamry_measurement_owner = None
 
         self.port_var = tk.StringVar()
@@ -690,6 +698,101 @@ class GantryMotionUI(tk.Tk):
             row=1, column=2, columnspan=2, sticky="ew", padx=4, pady=(4, 0)
         )
 
+        resume_preview_button = ttk.Button(
+            frame,
+            text="LOAD EXPERIMENT CHECKPOINT",
+            command=lambda: choose_and_show_experiment(self, self.prepare_eis_cv_resume),
+        )
+        resume_preview_button.grid(
+            row=2, column=0, columnspan=4, sticky="ew", padx=4, pady=(4, 0)
+        )
+
+    def prepare_eis_cv_resume(self, preview, mode, selected_indices):
+        if self.gamry_pstat is None:
+            messagebox.showerror(
+                "Resume experiment", "Connect Gamry before preparing resume", parent=self
+            )
+            return False
+        data = preview["data"]
+        if data["method"] != "EIS_GetRu_compensated_CV":
+            messagebox.showerror(
+                "Resume experiment", "This increment supports EIS + compensated CV only", parent=self
+            )
+            return False
+        manager = ExperimentDataManager.from_manifest(preview["path"])
+        try:
+            points = manager.points_for_resume(mode, selected_indices)
+        except ValueError as error:
+            messagebox.showerror("Resume experiment", str(error), parent=self)
+            return False
+        if not points:
+            messagebox.showinfo("Resume experiment", "No points match this resume mode", parent=self)
+            return False
+        if self.xy_eis_cv_window is not None and self.xy_eis_cv_window.winfo_exists():
+            if self.xy_eis_cv_window.running:
+                messagebox.showerror("Resume experiment", "An EIS + CV cycle is already running", parent=self)
+                return False
+            self.xy_eis_cv_window.destroy()
+        resume_window = XYEISCompCVCycleWindow(
+            self, points, data["path_name"], self.send_command, self.current_scan_xy,
+            self.current_machine_position, self.xy_dry_run_guard,
+            self.lock_for_xy_dry_run, self.gamry_pstat, tkp,
+            self.claim_gamry_measurement, self.release_gamry_measurement,
+            resume_manager=manager, homed_provider=self.xy_homed_state,
+            home_status_provider=self.xy_home_status,
+        )
+        self.xy_eis_cv_window = resume_window
+        self.xy_resume_window = resume_window
+        labels = {
+            "unfinished": "unfinished points",
+            "all": "all points",
+            "selected": "selected points: {}".format(
+                ", ".join(str(item) for item in sorted(selected_indices))
+            ),
+        }
+        self.xy_eis_cv_window.status_var.set(
+            "CHECKPOINT LOADED — {} — review parameters, then press START".format(labels[mode])
+        )
+        return True
+
+    def register_resume_serial_listener(self, window):
+        self.resume_serial_listeners = [
+            item for item in self.resume_serial_listeners
+            if item is not window and self._window_exists(item)
+        ]
+        self.resume_serial_listeners.append(window)
+
+    @staticmethod
+    def _window_exists(window):
+        if window is None:
+            return False
+        try:
+            return bool(window.winfo_exists())
+        except tk.TclError:
+            return False
+
+    def _active_resume_listener(self):
+        self.resume_serial_listeners = [
+            item for item in self.resume_serial_listeners
+            if self._window_exists(item)
+        ]
+        if self.resume_serial_listeners:
+            return self.resume_serial_listeners[-1]
+        return None
+
+    def xy_homed_state(self):
+        return (
+            self.homed_vars["X"].get() == "HOMED",
+            self.homed_vars["Y"].get() == "HOMED",
+        )
+
+    def xy_home_status(self):
+        return (
+            self.homed_vars["X"].get() == "HOMED",
+            self.moving_vars["X"].get() == "MOVING",
+            self.homed_vars["Y"].get() == "HOMED",
+            self.moving_vars["Y"].get() == "MOVING",
+        )
     def open_circular_path_window(self):
         if self.circular_path_window is not None and self.circular_path_window.winfo_exists():
             self.circular_path_window.lift()
@@ -756,6 +859,8 @@ class GantryMotionUI(tk.Tk):
             return False, "An EIS + compensated CV cycle is already running"
         if self.xy_full_ca_window is not None and self.xy_full_ca_window.winfo_exists() and self.xy_full_ca_window.running:
             return False, "A full CA cycle is already running"
+        if self.homed_vars["X"].get() != "HOMED" or self.homed_vars["Y"].get() != "HOMED":
+            return False, "Home X and Y before starting an automated cycle"
         if any(value.get() != "STOPPED" for value in self.pump_status_vars):
             return False, "Stop both pumps before an XY dry run"
         if self.gamry_measurement_owner is not None:
@@ -859,6 +964,8 @@ class GantryMotionUI(tk.Tk):
             self.current_machine_position, self.xy_dry_run_guard,
             self.lock_for_xy_dry_run, self.gamry_pstat, tkp,
             self.claim_gamry_measurement, self.release_gamry_measurement,
+            homed_provider=self.xy_homed_state,
+            home_status_provider=self.xy_home_status,
         )
 
     def open_xy_full_ca(self, points, path_name):
@@ -1184,12 +1291,52 @@ class GantryMotionUI(tk.Tk):
             self.status_var.set("Controller handshake is not complete")
             return False
         try:
+            if command != "KEEPALIVE" and self._resume_trace_active():
+                self._trace_automation("TX {} | {}".format(command, self._automation_snapshot()))
             self.serial_port.write((command.strip() + "\n").encode("ascii"))
             self.serial_port.flush()
             return True
         except (OSError, serial.SerialException) as error:
             self.disconnect_serial("Serial write failed: {}".format(error))
             return False
+
+    def _automation_snapshot(self):
+        window = self._active_resume_listener()
+        if window is None:
+            return "window=None"
+        try:
+            exists = bool(window.winfo_exists())
+        except tk.TclError:
+            exists = False
+        if not exists:
+            return "window=destroyed"
+        return "window={} running={} align={} press={} point={}/{}".format(
+            hex(id(window)),
+            int(bool(getattr(window, "running", False))),
+            getattr(window, "formal_alignment_state", None),
+            getattr(window, "press_state", None),
+            getattr(window, "point_offset", None),
+            len(getattr(window, "points", ())),
+        )
+
+    def _resume_trace_active(self):
+        window = self._active_resume_listener()
+        if window is None:
+            return False
+        try:
+            return bool(window.winfo_exists()) and getattr(
+                window, "resume_manager", None
+            ) is not None
+        except tk.TclError:
+            return False
+
+    def _trace_automation(self, message):
+        try:
+            stamp = time.strftime("%Y-%m-%d %H:%M:%S")
+            with self.automation_trace_path.open("a", encoding="utf-8") as stream:
+                stream.write("{} {}\n".format(stamp, message))
+        except (OSError, AttributeError):
+            pass
 
     def service_serial(self):
         if self.is_serial_open():
@@ -1228,6 +1375,15 @@ class GantryMotionUI(tk.Tk):
         self.after(SERIAL_POLL_MS, self.service_serial)
 
     def handle_serial_line(self, line):
+        trace_line = self._resume_trace_active() and line.startswith(("EVENT,", "ERROR,"))
+        if self._resume_trace_active() and line.startswith("STATUS,") and any(
+            marker in line for marker in (",PR=1", ",PR=2")
+        ):
+            trace_line = True
+        if trace_line:
+            self._trace_automation(
+                "RX {} | BEFORE {}".format(line, self._automation_snapshot())
+            )
         if line == "READY,{}".format(CONTROLLER_ID) or line == "IDENTITY,{}".format(
             CONTROLLER_ID
         ):
@@ -1245,9 +1401,12 @@ class GantryMotionUI(tk.Tk):
 
         if line.startswith("STATUS,"):
             self.parse_status(line)
+            if trace_line:
+                self._trace_automation("AFTER STATUS | {}".format(self._automation_snapshot()))
             return
 
         if line.startswith("EVENT,") or line.startswith("ERROR,"):
+            resume_window = self._active_resume_listener()
             if self.xy_dry_run_window is not None and self.xy_dry_run_window.winfo_exists():
                 self.xy_dry_run_window.handle_controller_line(line)
             if self.xy_press_cycle_window is not None and self.xy_press_cycle_window.winfo_exists():
@@ -1258,10 +1417,29 @@ class GantryMotionUI(tk.Tk):
                 self.xy_full_cv_window.handle_controller_line(line)
             if self.xy_full_eis_window is not None and self.xy_full_eis_window.winfo_exists():
                 self.xy_full_eis_window.handle_controller_line(line)
-            if self.xy_eis_cv_window is not None and self.xy_eis_cv_window.winfo_exists():
+            if (
+                self.xy_eis_cv_window is not None
+                and self.xy_eis_cv_window is not resume_window
+                and self.xy_eis_cv_window.winfo_exists()
+            ):
                 self.xy_eis_cv_window.handle_controller_line(line)
+            if (
+                resume_window is not None
+                and resume_window.winfo_exists()
+            ):
+                try:
+                    resume_window.handle_controller_line(line)
+                except Exception as error:
+                    self._trace_automation(
+                        "RESUME EVENT ERROR {}: {}".format(type(error).__name__, error)
+                    )
+                    resume_window.status_var.set(
+                        "RESUME EVENT ERROR — {}".format(error)
+                    )
             if self.xy_full_ca_window is not None and self.xy_full_ca_window.winfo_exists():
                 self.xy_full_ca_window.handle_controller_line(line)
+            if trace_line:
+                self._trace_automation("AFTER EVENT | {}".format(self._automation_snapshot()))
             self.status_var.set(line)
             if line.startswith("EVENT,PRESS_FORCE_STOP"):
                 self.press_status_var.set("STOPPED — FORCE THRESHOLD")
@@ -1298,6 +1476,7 @@ class GantryMotionUI(tk.Tk):
     def parse_status(self, line):
         try:
             values = parse_status_line(line)
+            resume_window = self._active_resume_listener()
 
             for axis in self.AXES:
                 machine_position = float(values[axis])
@@ -1363,8 +1542,25 @@ class GantryMotionUI(tk.Tk):
                 self.xy_full_cv_window.handle_status(values)
             if self.xy_full_eis_window is not None and self.xy_full_eis_window.winfo_exists():
                 self.xy_full_eis_window.handle_status(values)
-            if self.xy_eis_cv_window is not None and self.xy_eis_cv_window.winfo_exists():
+            if (
+                self.xy_eis_cv_window is not None
+                and self.xy_eis_cv_window is not resume_window
+                and self.xy_eis_cv_window.winfo_exists()
+            ):
                 self.xy_eis_cv_window.handle_status(values)
+            if (
+                resume_window is not None
+                and resume_window.winfo_exists()
+            ):
+                try:
+                    resume_window.handle_status(values)
+                except Exception as error:
+                    self._trace_automation(
+                        "RESUME STATUS ERROR {}: {}".format(type(error).__name__, error)
+                    )
+                    resume_window.status_var.set(
+                        "RESUME STATUS ERROR — {}".format(error)
+                    )
             if self.xy_full_ca_window is not None and self.xy_full_ca_window.winfo_exists():
                 self.xy_full_ca_window.handle_status(values)
         except (KeyError, ValueError):

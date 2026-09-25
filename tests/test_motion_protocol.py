@@ -24,8 +24,10 @@ if "serial" not in sys.modules:
     sys.modules["serial.tools.list_ports"] = serial_list_ports_module
 
 sys.path.insert(0, str(ROOT))
-from x_control import extract_complete_lines, parse_status_line  # noqa: E402
+from x_control import GantryMotionUI, extract_complete_lines, parse_status_line  # noqa: E402
 from experiment_data import ExperimentDataManager  # noqa: E402
+from experiment_resume_preview import load_experiment_preview  # noqa: E402
+from xy_eis_comp_cv_cycle import XYEISCompCVCycleWindow  # noqa: E402
 from circular_scan_path import generate_circular_path  # noqa: E402
 from rectangular_scan_path import generate_rectangular_path  # noqa: E402
 
@@ -418,12 +420,12 @@ class MotionProtocolTests(unittest.TestCase):
         self.assertIn('"point_index", "scan_x_mm", "scan_y_mm"', runner)
         self.assertIn("self._restore_measurement_pumps()", source)
 
-    def test_automatic_cycles_do_not_require_homing_and_restore_pumps_after_gamry_setup(self):
+    def test_automatic_cycles_require_homing_and_restore_pumps_after_gamry_setup(self):
         ui = (ROOT / "x_control.py").read_text(encoding="utf-8")
         pump = (ROOT / "xy_pump_cycle.py").read_text(encoding="utf-8")
         ca = (ROOT / "xy_full_ca_cycle.py").read_text(encoding="utf-8")
         compensated = (ROOT / "xy_eis_comp_cv_cycle.py").read_text(encoding="utf-8")
-        self.assertNotIn("Home X and Y before an automated dry run", ui)
+        self.assertIn("Home X and Y before starting an automated cycle", ui)
         self.assertIn("def _restore_measurement_pumps", pump)
         self.assertIn("self._restore_measurement_pumps()", ca)
         self.assertIn("self._restore_measurement_pumps()", compensated)
@@ -494,6 +496,192 @@ class MotionProtocolTests(unittest.TestCase):
             self.assertEqual(manifest["points"][0]["status"], "completed")
             self.assertEqual(manifest["points"][0]["attempts"][0]["status"], "completed")
 
+    def test_experiment_resume_preview_is_read_only_and_finds_next_point(self):
+        points = [
+            {"index": 1, "x": 0.0, "y": 0.0},
+            {"index": 2, "x": 1.0, "y": 0.0},
+        ]
+        with tempfile.TemporaryDirectory() as folder:
+            manager = ExperimentDataManager(folder, "CV", "test path", points, {})
+            manager.begin_point(points[0])
+            manager.complete_point(1)
+            before = manager.manifest_path.read_bytes()
+            preview = load_experiment_preview(manager.manifest_path)
+            after = manager.manifest_path.read_bytes()
+            self.assertEqual(before, after)
+            self.assertEqual(preview["counts"]["completed"], 1)
+            self.assertEqual(preview["counts"]["pending"], 1)
+            self.assertEqual(preview["next_point"]["index"], 2)
+
+    def test_resume_manager_preserves_completed_and_creates_next_attempt(self):
+        points = [
+            {"index": 1, "x": 0.0, "y": 0.0},
+            {"index": 2, "x": 1.0, "y": 0.0},
+        ]
+        with tempfile.TemporaryDirectory() as folder:
+            manager = ExperimentDataManager(folder, "EIS_GetRu_compensated_CV", "path", points, {})
+            manager.begin_point(points[0]); manager.complete_point(1)
+            manager.begin_point(points[1])
+            resumed = ExperimentDataManager.from_manifest(manager.manifest_path)
+            remaining = resumed.resumable_points()
+            self.assertEqual([item["index"] for item in remaining], [2])
+            folder2 = resumed.begin_point(remaining[0])
+            self.assertEqual(folder2.name, "attempt_002")
+            self.assertEqual(resumed.data["points"][0]["status"], "completed")
+            attempts = resumed.data["points"][1]["attempts"]
+            self.assertEqual(attempts[0]["status"], "failed")
+            self.assertEqual(attempts[1]["status"], "running")
+
+    def test_resume_manager_supports_unfinished_all_and_selected_modes(self):
+        points = [
+            {"index": 1, "x": 0.0, "y": 0.0},
+            {"index": 2, "x": 1.0, "y": 0.0},
+            {"index": 3, "x": 2.0, "y": 0.0},
+        ]
+        with tempfile.TemporaryDirectory() as folder:
+            manager = ExperimentDataManager(folder, "CV", "path", points, {})
+            manager.begin_point(points[0]); manager.complete_point(1)
+            self.assertEqual([p["index"] for p in manager.points_for_resume("unfinished")], [2, 3])
+            self.assertEqual([p["index"] for p in manager.points_for_resume("all")], [1, 2, 3])
+            self.assertEqual([p["index"] for p in manager.points_for_resume("selected", {3, 1})], [1, 3])
+            with self.assertRaises(ValueError):
+                manager.points_for_resume("selected", set())
+
+    def test_eis_comp_cv_checkpoint_resume_is_explicitly_wired(self):
+        ui = (ROOT / "x_control.py").read_text(encoding="utf-8")
+        cycle = (ROOT / "xy_eis_comp_cv_cycle.py").read_text(encoding="utf-8")
+        self.assertIn("def prepare_eis_cv_resume", ui)
+        self.assertIn("resume_manager=manager", ui)
+        self.assertIn("self.xy_resume_window = resume_window", ui)
+        self.assertIn("def register_resume_serial_listener", ui)
+        self.assertIn("def _active_resume_listener", ui)
+        self.assertIn("resume_window.handle_controller_line(line)", ui)
+        self.assertIn("resume_window.handle_status(values)", ui)
+        self.assertIn("parent.register_resume_serial_listener(self)", cycle)
+        self.assertIn("RESUME EVENT ERROR", ui)
+        self.assertIn("RESUME STATUS ERROR", ui)
+        self.assertIn("self.xy_eis_cv_window is not resume_window", ui)
+        home_panel = ui[ui.index("    def build_home_panel"):ui.index("    def prepare_eis_cv_resume")]
+        self.assertIn('text="LOAD EXPERIMENT CHECKPOINT"', home_panel)
+        self.assertIn("resume_preview_button.grid(", home_panel)
+        self.assertNotIn("Milestone 7", ui)
+        self.assertIn("def _apply_resume_settings", cycle)
+        self.assertIn('self.status_var.set("CHECKPOINT LOADED', cycle)
+
+    def test_resume_restores_saved_scan_zero_without_automatic_homing(self):
+        source = (ROOT / "xy_eis_comp_cv_cycle.py").read_text(encoding="utf-8")
+        ui = (ROOT / "x_control.py").read_text(encoding="utf-8")
+        self.assertNotIn('text="FORMAL EXPERIMENT', source)
+        self.assertNotIn('self.send_command("HOME X")', source)
+        self.assertNotIn('self.send_command("HOME Y")', source)
+        self.assertIn('self.send_command("SCAN_ZERO")', source)
+        self.assertIn("def _poll_formal_home", source)
+        self.assertIn('self.send_command("STATUS", require_ready=False)', source)
+        self.assertIn("def _start_formal_origin_move", source)
+        self.assertIn("stopped {:.3f} mm from saved Scan Zero", source)
+        self.assertIn("def _complete_formal_alignment", source)
+        self.assertIn("def _start_standard_measurement", source)
+        self.assertIn("self.after(100, self._start_standard_measurement)", source)
+        self.assertNotIn("self.after(100, self.start)", source)
+        self.assertIn('settings["scan_origin_machine"]', source)
+        self.assertIn("homed_provider=self.xy_homed_state", ui)
+        self.assertIn("home_status_provider=self.xy_home_status", ui)
+        self.assertIn("def xy_home_status", ui)
+        self.assertIn("def _start_resumed_measurement_only", source)
+        self.assertIn("XYPumpCycleWindow.start(self)", source)
+        self.assertIn("def _start_resume_axis_move", source)
+        self.assertIn("def _poll_resume_move", source)
+        self.assertIn("RESUME_POSITION_TOLERANCE_MM = 0.004", source)
+
+    def test_resume_positioner_advances_x_then_y_then_arrives(self):
+        cycle = XYEISCompCVCycleWindow.__new__(XYEISCompCVCycleWindow)
+        position = [0.0, 0.0]
+        sent = []
+        statuses = []
+        arrived = []
+        scheduled = {"callback": None}
+        cycle.resume_manager = object()
+        cycle.formal_alignment_state = None
+        cycle.running = True
+        cycle.points = [{"index": 3, "x": 1.5, "y": -2.0}]
+        cycle.point_offset = 0
+        cycle.resume_move_axis = None
+        cycle.resume_move_target = None
+        cycle.resume_move_deadline = None
+        cycle.resume_move_poll_id = None
+        cycle.awaiting_axis = None
+        cycle.after_id = None
+        cycle.speed_var = types.SimpleNamespace(get=lambda: 1.0)
+        cycle.status_var = types.SimpleNamespace(set=statuses.append)
+        cycle.position_provider = lambda: tuple(position)
+        cycle.send_command = lambda command, require_ready=True: sent.append(command) or True
+        cycle.after_cancel = lambda unused_id: None
+        cycle.after = lambda unused_ms, callback: scheduled.update(callback=callback) or "after-id"
+        cycle._finish = lambda message: self.fail(message)
+        cycle._arrived = lambda: arrived.append(True)
+
+        cycle._start_resume_axis_move("X", 1.5)
+        self.assertEqual(sent[-1], "MOVE X 1.500")
+        position[0] = 1.5
+        cycle._poll_resume_move()
+        self.assertEqual(cycle.resume_move_axis, None)
+        scheduled["callback"]()
+        self.assertEqual(sent[-1], "MOVE Y -2.000")
+        position[1] = -2.0
+        cycle._poll_resume_move()
+        scheduled["callback"]()
+        self.assertEqual(arrived, [True])
+
+    def test_resume_press_bridge_starts_existing_pump_flow_after_force_stop(self):
+        cycle = XYEISCompCVCycleWindow.__new__(XYEISCompCVCycleWindow)
+        started = []
+        cycle.resume_manager = object()
+        cycle.formal_alignment_state = None
+        cycle.resume_move_axis = None
+        cycle.resume_press_poll_id = None
+        cycle.resume_press_peak_force = 0.0
+        cycle.resume_press_motion_seen = False
+        cycle.running = True
+        cycle.press_state = "pressing"
+        cycle.press_force = 30.0
+        cycle.reported_pump_states = None
+        cycle.awaiting_axis = None
+        cycle.xy_var = types.SimpleNamespace(set=lambda unused: None)
+        cycle.status_var = types.SimpleNamespace(set=lambda unused: None)
+        cycle.after_cancel = lambda unused: None
+        cycle._resume_trace = lambda unused: None
+        cycle._start_pumps = lambda: started.append(True)
+
+        moving = {
+            "PR": "1", "F": "30.2", "PD": "0.5", "SX": "1.5", "SY": "1.5",
+            "PUMP0RUNNING": "0", "PUMP1RUNNING": "0",
+        }
+        stopped = dict(moving, PR="0", F="29.5")
+        cycle.handle_status(moving)
+        self.assertEqual(started, [])
+        cycle.handle_status(stopped)
+        self.assertEqual(started, [True])
+
+    def test_resume_listener_registers_during_window_construction_lifecycle(self):
+        ui = GantryMotionUI.__new__(GantryMotionUI)
+        ui.resume_serial_listeners = []
+        listener = types.SimpleNamespace(winfo_exists=lambda: 1)
+        ui.register_resume_serial_listener(listener)
+        self.assertIs(ui._active_resume_listener(), listener)
+
+    def test_checkpoint_preview_plots_status_and_supports_hover_selection(self):
+        source = (ROOT / "experiment_resume_preview.py").read_text(encoding="utf-8")
+        for status in ("completed", "failed", "running", "pending"):
+            self.assertIn('"{}"'.format(status), source)
+        self.assertIn('mpl_connect("motion_notify_event", self._on_hover)', source)
+        self.assertIn('mpl_connect("button_press_event", self._on_click)', source)
+        self.assertIn("Last reason:", source)
+        self.assertIn("self.axes.invert_yaxis()", source)
+        self.assertIn("self.selected_indices", source)
+        self.assertIn('text="RESUME UNFINISHED"', source)
+        self.assertIn('text="RESTART ALL"', source)
+        self.assertIn('text="REMEASURE SELECTED"', source)
+
     def test_python_sources_parse_on_python_37_grammar(self):
         for relative_path in (
             "x_control.py",
@@ -515,6 +703,7 @@ class MotionProtocolTests(unittest.TestCase):
             "auto_ca_measurement.py",
             "xy_full_ca_cycle.py",
             "experiment_data.py",
+            "experiment_resume_preview.py",
             "tests/test_motion_protocol.py",
         ):
             source = (ROOT / relative_path).read_text(encoding="utf-8")
