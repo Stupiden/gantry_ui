@@ -122,8 +122,8 @@ def initialize_pstat(pstat) -> None:
 
     pstat.set_analog_out(0.0)
     pstat.set_voltage(0.0)
-    pstat.set_pos_feed_enable(False)
     pstat.set_pos_feed_resistance(0.0)
+    pstat.set_pos_feed_enable(False)
 
     try:
         pstat.set_irupt_mode(tkp.IRUPTOFF)

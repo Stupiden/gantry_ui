@@ -59,7 +59,8 @@ class RectangularScanPathWindow(tk.Toplevel):
 
     def __init__(
         self, parent, dry_run_callback=None, press_cycle_callback=None,
-        pump_cycle_callback=None, full_cv_callback=None
+        pump_cycle_callback=None, full_cv_callback=None,
+        full_eis_callback=None, eis_cv_callback=None, full_ca_callback=None
     ):
         tk.Toplevel.__init__(self, parent)
         self.title("Rectangular scan path — preview only")
@@ -83,6 +84,9 @@ class RectangularScanPathWindow(tk.Toplevel):
         self.press_cycle_callback = press_cycle_callback
         self.pump_cycle_callback = pump_cycle_callback
         self.full_cv_callback = full_cv_callback
+        self.full_eis_callback = full_eis_callback
+        self.eis_cv_callback = eis_cv_callback
+        self.full_ca_callback = full_ca_callback
         self._build_ui()
 
     def _build_ui(self):
@@ -137,6 +141,18 @@ class RectangularScanPathWindow(tk.Toplevel):
             controls, text="FULL CV CYCLE", command=self.start_full_cv, state="disabled"
         )
         self.full_cv_button.grid(row=5, column=7, padx=4)
+        self.full_eis_button = ttk.Button(
+            controls, text="FULL EIS CYCLE", command=self.start_full_eis, state="disabled"
+        )
+        self.full_eis_button.grid(row=6, column=7, padx=4)
+        self.eis_cv_button = ttk.Button(
+            controls, text="EIS + COMP CV", command=self.start_eis_cv, state="disabled"
+        )
+        self.eis_cv_button.grid(row=7, column=7, padx=4)
+        self.full_ca_button = ttk.Button(
+            controls, text="FULL CA CYCLE", command=self.start_full_ca, state="disabled"
+        )
+        self.full_ca_button.grid(row=8, column=7, padx=4)
         ttk.Label(controls, textvariable=self.summary_var).grid(
             row=3, column=0, columnspan=8, sticky="w", pady=(6, 0)
         )
@@ -281,6 +297,12 @@ class RectangularScanPathWindow(tk.Toplevel):
             self.pump_cycle_button.configure(state="normal")
         if self.full_cv_callback is not None:
             self.full_cv_button.configure(state="normal")
+        if self.full_eis_callback is not None:
+            self.full_eis_button.configure(state="normal")
+        if self.eis_cv_callback is not None:
+            self.eis_cv_button.configure(state="normal")
+        if self.full_ca_callback is not None:
+            self.full_ca_button.configure(state="normal")
 
     def _on_plot_hover(self, event):
         if self.path_line is None or self.hover_annotation is None:
@@ -317,6 +339,18 @@ class RectangularScanPathWindow(tk.Toplevel):
     def start_full_cv(self):
         if self.points and self.full_cv_callback is not None:
             self.full_cv_callback(self.points, "Rectangular path")
+
+    def start_full_eis(self):
+        if self.points and self.full_eis_callback is not None:
+            self.full_eis_callback(self.points, "Rectangular path")
+
+    def start_eis_cv(self):
+        if self.points and self.eis_cv_callback is not None:
+            self.eis_cv_callback(self.points, "Rectangular path")
+
+    def start_full_ca(self):
+        if self.points and self.full_ca_callback is not None:
+            self.full_ca_callback(self.points, "Rectangular path")
 
     def export_csv(self):
         if not self.points:

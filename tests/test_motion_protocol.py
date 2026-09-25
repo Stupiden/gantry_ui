@@ -267,6 +267,22 @@ class MotionProtocolTests(unittest.TestCase):
         self.assertNotIn("run_cv", eis_ui)
         self.assertNotIn("run_ca", eis_ui)
 
+    def test_gamry_disconnect_releases_all_pstat_owners(self):
+        source = (ROOT / "x_control.py").read_text(encoding="utf-8")
+        self.assertIn("def _dispose_gamry_windows(self):", source)
+        self.assertIn('"xy_full_eis_window", "xy_eis_cv_window"', source)
+        self.assertIn("runner.pstat = None", source)
+        self.assertIn("self._dispose_gamry_windows()", source)
+        self.assertIn("gc.collect()", source)
+
+    def test_eis_initialization_clears_pos_feed_before_disabling_it(self):
+        source = (ROOT / "pre_gamry_eis_getru_max.py").read_text(encoding="utf-8")
+        initialize = source[source.index("def initialize_pstat"):source.index("def _normalize_pose4")]
+        self.assertLess(
+            initialize.index("pstat.set_pos_feed_resistance(0.0)"),
+            initialize.index("pstat.set_pos_feed_enable(False)"),
+        )
+
     def test_circular_scan_path_is_centered_clipped_and_serpentine(self):
         points = generate_circular_path(10.0, -5.0, 4.0, 1.0)
         self.assertEqual(len(points), 13)
@@ -396,6 +412,46 @@ class MotionProtocolTests(unittest.TestCase):
         self.assertIn("self.pstat.set_cell(False)", runner)
         self.assertIn('"point_index", "scan_x_mm", "scan_y_mm"', runner)
 
+    def test_full_eis_cycle_keeps_pumps_on_until_getru_finishes(self):
+        source = (ROOT / "xy_full_eis_cycle.py").read_text(encoding="utf-8")
+        runner = (ROOT / "auto_eis_measurement.py").read_text(encoding="utf-8")
+        self.assertIn("GamryEIS", runner)
+        self.assertIn("result[\"avg_ru\"]", source)
+        self.assertIn("EIS_point_{:04d}", source)
+        self.assertLess(source.index('"PUMP START {}"'), source.index("self.eis_runner.start("))
+        complete = source[source.index("    def _eis_complete"):source.index("    def _start_lift_after_wait")]
+        self.assertIn("self._pump_time_complete(selected_id)", complete)
+        self.assertIn("self.reported_pump_states != (False, False)", source)
+
+    def test_getru_compensated_cv_uses_measured_ru_and_positive_feedback(self):
+        source = (ROOT / "xy_eis_comp_cv_cycle.py").read_text(encoding="utf-8")
+        runner = (ROOT / "auto_cv_measurement.py").read_text(encoding="utf-8")
+        self.assertIn('ru = float(result["avg_ru"])', source)
+        self.assertIn("resistance = ru * self.comp_fraction", source)
+        self.assertIn('"pos_feed_resistance": resistance', source)
+        self.assertIn("self.cv_runner.start(", source)
+        self.assertIn("resistance > 0.0", runner)
+        self.assertIn('self.pstat.set_pos_feed_enable(False)', runner)
+
+    def test_automatic_cv_and_eis_have_live_plots(self):
+        plot = (ROOT / "automatic_live_plot.py").read_text(encoding="utf-8")
+        cv = (ROOT / "xy_full_cv_cycle.py").read_text(encoding="utf-8")
+        eis = (ROOT / "xy_full_eis_cycle.py").read_text(encoding="utf-8")
+        self.assertIn("def update_cv", plot)
+        self.assertIn("def update_eis_csv", plot)
+        self.assertIn("self.live_plot.update_cv", cv)
+        self.assertIn("self.live_plot.update_eis_csv", eis)
+
+    def test_automatic_ca_has_live_plot_and_measurement_interlocks(self):
+        plot = (ROOT / "automatic_live_plot.py").read_text(encoding="utf-8")
+        source = (ROOT / "xy_full_ca_cycle.py").read_text(encoding="utf-8")
+        runner = (ROOT / "auto_ca_measurement.py").read_text(encoding="utf-8")
+        self.assertIn("def update_ca", plot)
+        self.assertIn("self.live_plot.update_ca", source)
+        self.assertIn("signal_d_step_new", runner)
+        self.assertLess(source.index('"PUMP START {}"'), source.index("self.ca_runner.start("))
+        self.assertIn("self._pump_time_complete(selected_id)", source)
+
     def test_python_sources_parse_on_python_37_grammar(self):
         for relative_path in (
             "x_control.py",
@@ -410,6 +466,12 @@ class MotionProtocolTests(unittest.TestCase):
             "xy_pump_cycle.py",
             "auto_cv_measurement.py",
             "xy_full_cv_cycle.py",
+            "auto_eis_measurement.py",
+            "xy_full_eis_cycle.py",
+            "automatic_live_plot.py",
+            "xy_eis_comp_cv_cycle.py",
+            "auto_ca_measurement.py",
+            "xy_full_ca_cycle.py",
             "tests/test_motion_protocol.py",
         ):
             source = (ROOT / relative_path).read_text(encoding="utf-8")

@@ -7,6 +7,7 @@ import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 
 from auto_cv_measurement import AutoCVMeasurement
+from automatic_live_plot import AutomaticLivePlot
 from xy_pump_cycle import XYPumpCycleWindow
 
 
@@ -32,6 +33,7 @@ class XYFullCVCycleWindow(XYPumpCycleWindow):
         self.pump_start_deadline = None
         self.pump_stop_deadline = None
         self.cv_runner = AutoCVMeasurement(self, pstat, tkp)
+        self.live_plot = AutomaticLivePlot(self, show_cv=True)
 
         self.cv_initial_var = tk.DoubleVar(value=0.0)
         self.cv_apex1_var = tk.DoubleVar(value=0.0)
@@ -170,11 +172,14 @@ class XYFullCVCycleWindow(XYPumpCycleWindow):
             int(point["index"]), float(point["x"]), float(point["y"]), stamp
         )
         self.press_state = "measuring_cv"
+        self.live_plot.deiconify()
+        self.live_plot.clear_cv()
         self.status_var.set("CV RUNNING AT POINT {} — pumps ON — cell ON".format(point["index"]))
         try:
             self.cv_runner.start(
                 self.cv_params, self.output_dir / filename, point,
                 self.machine_position_provider(), self._cv_complete, self._cv_error,
+                self.live_plot.update_cv,
             )
         except Exception as error:
             self._cv_error(error)

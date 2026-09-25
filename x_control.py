@@ -1,5 +1,6 @@
 """Milestone 7: motion, force control, and Gamry connection status."""
 
+import gc
 import sys
 import struct
 import time
@@ -18,6 +19,9 @@ from xy_dry_run import XYDryRunWindow
 from xy_press_cycle import XYPressCycleWindow
 from xy_pump_cycle import XYPumpCycleWindow
 from xy_full_cv_cycle import XYFullCVCycleWindow
+from xy_full_eis_cycle import XYFullEISCycleWindow
+from xy_eis_comp_cv_cycle import XYEISCompCVCycleWindow
+from xy_full_ca_cycle import XYFullCACycleWindow
 
 try:
     import toolkitpy as tkp
@@ -147,6 +151,9 @@ class GantryMotionUI(tk.Tk):
         self.xy_press_cycle_window = None
         self.xy_pump_cycle_window = None
         self.xy_full_cv_window = None
+        self.xy_full_eis_window = None
+        self.xy_eis_cv_window = None
+        self.xy_full_ca_window = None
         self.gamry_measurement_owner = None
 
         self.port_var = tk.StringVar()
@@ -304,8 +311,41 @@ class GantryMotionUI(tk.Tk):
 
     def close_gamry_toolkit(self):
         if self.gamry_toolkit_initialized:
-            tkp.toolkitpy_close()
-            self.gamry_toolkit_initialized = False
+            try:
+                tkp.toolkitpy_close()
+            finally:
+                self.gamry_toolkit_initialized = False
+
+    def _dispose_gamry_windows(self):
+        window_names = (
+            "cv_window", "ca_window", "eis_window",
+            "xy_full_cv_window", "xy_full_eis_window", "xy_eis_cv_window", "xy_full_ca_window",
+        )
+        for name in window_names:
+            window = getattr(self, name)
+            if window is None:
+                continue
+            for runner_name in ("cv_runner", "eis_runner", "ca_runner"):
+                runner = getattr(window, runner_name, None)
+                if runner is None:
+                    continue
+                engine = getattr(runner, "engine", None)
+                if engine is not None:
+                    try:
+                        engine.close()
+                    except Exception:
+                        pass
+                    runner.engine = None
+                runner.pstat = None
+            if hasattr(window, "pstat"):
+                window.pstat = None
+            try:
+                if window.winfo_exists():
+                    window.destroy()
+            except tk.TclError:
+                pass
+            setattr(self, name, None)
+        self.gamry_measurement_owner = None
 
     def detect_gamry(self):
         if self.gamry_pstat is not None:
@@ -370,6 +410,17 @@ class GantryMotionUI(tk.Tk):
         self.status_var.set("Gamry connected: PSTAT")
 
     def disconnect_gamry(self):
+        for window, name in (
+            (self.xy_full_eis_window, "FULL EIS CYCLE"),
+            (self.xy_eis_cv_window, "EIS + COMP CV CYCLE"),
+            (self.xy_full_ca_window, "FULL CA CYCLE"),
+        ):
+            if window is not None and window.winfo_exists() and (
+                window.running
+                or (hasattr(window, "eis_runner") and window.eis_runner.running)
+            ):
+                self.status_var.set("Stop {} before disconnecting Gamry".format(name))
+                return
         if (
             self.xy_full_cv_window is not None
             and self.xy_full_cv_window.winfo_exists()
@@ -391,7 +442,9 @@ class GantryMotionUI(tk.Tk):
                 self.gamry_pstat.set_cell(False)
             except Exception as error:
                 self.status_var.set("Gamry close warning: {}".format(error))
+        self._dispose_gamry_windows()
         self.gamry_pstat = None
+        gc.collect()
         try:
             self.close_gamry_toolkit()
         except Exception as error:
@@ -644,7 +697,8 @@ class GantryMotionUI(tk.Tk):
             return
         self.circular_path_window = CircularScanPathWindow(
             self, self.open_xy_dry_run, self.open_xy_press_cycle,
-            self.open_xy_pump_cycle, self.open_xy_full_cv
+            self.open_xy_pump_cycle, self.open_xy_full_cv,
+            self.open_xy_full_eis, self.open_xy_eis_cv, self.open_xy_full_ca
         )
 
     def open_rectangular_path_window(self):
@@ -654,7 +708,8 @@ class GantryMotionUI(tk.Tk):
             return
         self.rectangular_path_window = RectangularScanPathWindow(
             self, self.open_xy_dry_run, self.open_xy_press_cycle,
-            self.open_xy_pump_cycle, self.open_xy_full_cv
+            self.open_xy_pump_cycle, self.open_xy_full_cv,
+            self.open_xy_full_eis, self.open_xy_eis_cv, self.open_xy_full_ca
         )
 
     def xy_dry_run_guard(self):
@@ -684,6 +739,23 @@ class GantryMotionUI(tk.Tk):
             and self.xy_full_cv_window.running
         ):
             return False, "A full CV cycle is already running"
+        if (
+            self.xy_full_eis_window is not None
+            and self.xy_full_eis_window.winfo_exists()
+            and (
+                self.xy_full_eis_window.running
+                or self.xy_full_eis_window.eis_runner.running
+            )
+        ):
+            return False, "A full EIS cycle is already running"
+        if (
+            self.xy_eis_cv_window is not None
+            and self.xy_eis_cv_window.winfo_exists()
+            and self.xy_eis_cv_window.running
+        ):
+            return False, "An EIS + compensated CV cycle is already running"
+        if self.xy_full_ca_window is not None and self.xy_full_ca_window.winfo_exists() and self.xy_full_ca_window.running:
+            return False, "A full CA cycle is already running"
         if self.homed_vars["X"].get() != "HOMED" or self.homed_vars["Y"].get() != "HOMED":
             return False, "Home X and Y before an automated dry run"
         if any(value.get() != "STOPPED" for value in self.pump_status_vars):
@@ -752,6 +824,56 @@ class GantryMotionUI(tk.Tk):
             self.current_machine_position, self.xy_dry_run_guard,
             self.lock_for_xy_dry_run, self.gamry_pstat, tkp,
             self.claim_gamry_measurement, self.release_gamry_measurement,
+        )
+
+    def open_xy_full_eis(self, points, path_name):
+        if self.gamry_pstat is None:
+            self.status_var.set("Connect Gamry before opening Full EIS Cycle")
+            return
+        if self.xy_full_eis_window is not None and self.xy_full_eis_window.winfo_exists():
+            if (
+                self.xy_full_eis_window.running
+                or self.xy_full_eis_window.eis_runner.running
+            ):
+                self.xy_full_eis_window.lift()
+                self.xy_full_eis_window.focus_force()
+                return
+            self.xy_full_eis_window.destroy()
+        self.xy_full_eis_window = XYFullEISCycleWindow(
+            self, points, path_name, self.send_command, self.current_scan_xy,
+            self.current_machine_position, self.xy_dry_run_guard,
+            self.lock_for_xy_dry_run, self.gamry_pstat,
+            self.claim_gamry_measurement, self.release_gamry_measurement,
+        )
+
+    def open_xy_eis_cv(self, points, path_name):
+        if self.gamry_pstat is None:
+            self.status_var.set("Connect Gamry before opening EIS + Compensated CV")
+            return
+        if self.xy_eis_cv_window is not None and self.xy_eis_cv_window.winfo_exists():
+            if self.xy_eis_cv_window.running or self.xy_eis_cv_window.eis_runner.running:
+                self.xy_eis_cv_window.lift()
+                self.xy_eis_cv_window.focus_force()
+                return
+            self.xy_eis_cv_window.destroy()
+        self.xy_eis_cv_window = XYEISCompCVCycleWindow(
+            self, points, path_name, self.send_command, self.current_scan_xy,
+            self.current_machine_position, self.xy_dry_run_guard,
+            self.lock_for_xy_dry_run, self.gamry_pstat, tkp,
+            self.claim_gamry_measurement, self.release_gamry_measurement,
+        )
+
+    def open_xy_full_ca(self, points, path_name):
+        if self.gamry_pstat is None:
+            self.status_var.set("Connect Gamry before opening Full CA Cycle"); return
+        if self.xy_full_ca_window is not None and self.xy_full_ca_window.winfo_exists():
+            if self.xy_full_ca_window.running:
+                self.xy_full_ca_window.lift(); self.xy_full_ca_window.focus_force(); return
+            self.xy_full_ca_window.destroy()
+        self.xy_full_ca_window = XYFullCACycleWindow(
+            self, points, path_name, self.send_command, self.current_scan_xy,
+            self.current_machine_position, self.xy_dry_run_guard, self.lock_for_xy_dry_run,
+            self.gamry_pstat, tkp, self.claim_gamry_measurement, self.release_gamry_measurement,
         )
 
     def build_limit_panel(self, parent):
@@ -1007,6 +1129,12 @@ class GantryMotionUI(tk.Tk):
             self.xy_pump_cycle_window.emergency_stopped()
         if self.xy_full_cv_window is not None and self.xy_full_cv_window.winfo_exists():
             self.xy_full_cv_window.emergency_stopped()
+        if self.xy_full_eis_window is not None and self.xy_full_eis_window.winfo_exists():
+            self.xy_full_eis_window.emergency_stopped()
+        if self.xy_eis_cv_window is not None and self.xy_eis_cv_window.winfo_exists():
+            self.xy_eis_cv_window.emergency_stopped()
+        if self.xy_full_ca_window is not None and self.xy_full_ca_window.winfo_exists():
+            self.xy_full_ca_window.emergency_stopped()
         if self.is_serial_open():
             try:
                 self.send_command("STOP", require_ready=False)
@@ -1130,6 +1258,12 @@ class GantryMotionUI(tk.Tk):
                 self.xy_pump_cycle_window.handle_controller_line(line)
             if self.xy_full_cv_window is not None and self.xy_full_cv_window.winfo_exists():
                 self.xy_full_cv_window.handle_controller_line(line)
+            if self.xy_full_eis_window is not None and self.xy_full_eis_window.winfo_exists():
+                self.xy_full_eis_window.handle_controller_line(line)
+            if self.xy_eis_cv_window is not None and self.xy_eis_cv_window.winfo_exists():
+                self.xy_eis_cv_window.handle_controller_line(line)
+            if self.xy_full_ca_window is not None and self.xy_full_ca_window.winfo_exists():
+                self.xy_full_ca_window.handle_controller_line(line)
             self.status_var.set(line)
             if line.startswith("EVENT,PRESS_FORCE_STOP"):
                 self.press_status_var.set("STOPPED — FORCE THRESHOLD")
@@ -1229,6 +1363,12 @@ class GantryMotionUI(tk.Tk):
                 self.xy_pump_cycle_window.handle_status(values)
             if self.xy_full_cv_window is not None and self.xy_full_cv_window.winfo_exists():
                 self.xy_full_cv_window.handle_status(values)
+            if self.xy_full_eis_window is not None and self.xy_full_eis_window.winfo_exists():
+                self.xy_full_eis_window.handle_status(values)
+            if self.xy_eis_cv_window is not None and self.xy_eis_cv_window.winfo_exists():
+                self.xy_eis_cv_window.handle_status(values)
+            if self.xy_full_ca_window is not None and self.xy_full_ca_window.winfo_exists():
+                self.xy_full_ca_window.handle_status(values)
         except (KeyError, ValueError):
             self.status_var.set("Invalid STATUS: {}".format(line))
 
@@ -1381,6 +1521,12 @@ class GantryMotionUI(tk.Tk):
             self.xy_pump_cycle_window.emergency_stopped()
         if self.xy_full_cv_window is not None and self.xy_full_cv_window.winfo_exists():
             self.xy_full_cv_window.emergency_stopped()
+        if self.xy_full_eis_window is not None and self.xy_full_eis_window.winfo_exists():
+            self.xy_full_eis_window.emergency_stopped()
+        if self.xy_eis_cv_window is not None and self.xy_eis_cv_window.winfo_exists():
+            self.xy_eis_cv_window.emergency_stopped()
+        if self.xy_full_ca_window is not None and self.xy_full_ca_window.winfo_exists():
+            self.xy_full_ca_window.emergency_stopped()
         if self.cv_window is not None and self.cv_window.winfo_exists():
             self.cv_window.stop_cv()
         if self.ca_window is not None and self.ca_window.winfo_exists():
@@ -1400,6 +1546,28 @@ class GantryMotionUI(tk.Tk):
             self.xy_pump_cycle_window.stop()
         if self.xy_full_cv_window is not None and self.xy_full_cv_window.winfo_exists():
             self.xy_full_cv_window.stop()
+        if self.xy_full_eis_window is not None and self.xy_full_eis_window.winfo_exists():
+            self.xy_full_eis_window.stop()
+        if self.xy_eis_cv_window is not None and self.xy_eis_cv_window.winfo_exists():
+            self.xy_eis_cv_window.stop()
+        if self.xy_full_ca_window is not None and self.xy_full_ca_window.winfo_exists():
+            self.xy_full_ca_window.stop()
+        if (
+            self.xy_full_eis_window is not None
+            and self.xy_full_eis_window.winfo_exists()
+            and self.xy_full_eis_window.eis_runner.running
+        ):
+            self.status_var.set("Waiting for automatic EIS to stop safely before closing")
+            self.after(250, self.on_close)
+            return
+        if (
+            self.xy_eis_cv_window is not None
+            and self.xy_eis_cv_window.winfo_exists()
+            and self.xy_eis_cv_window.eis_runner.running
+        ):
+            self.status_var.set("Waiting for GetRu to stop safely before closing")
+            self.after(250, self.on_close)
+            return
         if self.eis_window is not None and self.eis_window.winfo_exists():
             if self.eis_window.running:
                 self.eis_window.close_pending = True

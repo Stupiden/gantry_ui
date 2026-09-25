@@ -20,7 +20,7 @@ class AutoCVMeasurement:
         self.curve = None
         self.signal = None
 
-    def start(self, params, csv_path, point, position, on_complete, on_error):
+    def start(self, params, csv_path, point, position, on_complete, on_error, on_data=None):
         if self.running:
             raise RuntimeError("CV measurement is already running")
         self.params = dict(params)
@@ -30,6 +30,7 @@ class AutoCVMeasurement:
         self.position = tuple(position)
         self.on_complete = on_complete
         self.on_error = on_error
+        self.on_data = on_data
         self.last_count = 0
         self.curve_started = False
         self.curve_started_at = 0.0
@@ -41,8 +42,9 @@ class AutoCVMeasurement:
             self._call("initialize PSTAT", initialize_pstat_for_cv, self.pstat, self.tkp)
             self._call("disable auto IE range", self.pstat.set_ie_range_mode, False)
             self._call("set IE range", self.pstat.set_ie_range, params["ie_range"])
-            self._call("clear positive feedback resistance", self.pstat.set_pos_feed_resistance, 0.0)
-            self._call("disable positive feedback", self.pstat.set_pos_feed_enable, False)
+            resistance = float(params.get("pos_feed_resistance", 0.0))
+            self._call("set positive feedback resistance", self.pstat.set_pos_feed_resistance, resistance)
+            self._call("set positive feedback", self.pstat.set_pos_feed_enable, resistance > 0.0)
             sample_time = params["step_size"] / params["scan_rate"]
             self.signal = self._call(
                 "create CV signal", self.pstat.signal_r_up_dn_new,
@@ -83,6 +85,8 @@ class AutoCVMeasurement:
                 self.curve_started_at = time.monotonic()
 
             data = self.curve.acq_data()
+            if self.on_data is not None and len(data):
+                self.on_data(data)
             if len(data) > self.last_count:
                 self._append_csv(data[self.last_count:])
                 self.last_count = len(data)
@@ -117,6 +121,7 @@ class AutoCVMeasurement:
                     "machine_x_mm", "machine_y_mm", "machine_z_mm",
                     "initial_v", "apex1_v", "apex2_v", "final_v",
                     "scan_rate_v_s", "step_v", "cycles", "precharge_s", "ie_range",
+                    "ru_ohm", "compensation_fraction", "pos_feed_resistance_ohm",
                 ] + names)
             for row in data:
                 writer.writerow([
@@ -128,6 +133,9 @@ class AutoCVMeasurement:
                     self.params["scan_rate"], self.params["step_size"],
                     self.params["cycles"], self.params["precharge"],
                     self.params["ie_range"],
+                    self.params.get("ru_ohm", 0.0),
+                    self.params.get("compensation_fraction", 0.0),
+                    self.params.get("pos_feed_resistance", 0.0),
                 ] + [row[name] for name in names])
 
     def stop(self):
@@ -140,8 +148,8 @@ class AutoCVMeasurement:
 
     def _hardware_off(self):
         try:
-            self.pstat.set_pos_feed_enable(False)
             self.pstat.set_pos_feed_resistance(0.0)
+            self.pstat.set_pos_feed_enable(False)
         except Exception:
             pass
         try:
