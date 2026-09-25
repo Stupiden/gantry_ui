@@ -24,7 +24,13 @@ if "serial" not in sys.modules:
     sys.modules["serial.tools.list_ports"] = serial_list_ports_module
 
 sys.path.insert(0, str(ROOT))
-from x_control import GantryMotionUI, extract_complete_lines, parse_status_line  # noqa: E402
+from x_control import (  # noqa: E402
+    GantryMotionUI,
+    extract_complete_lines,
+    load_scan_start_offsets,
+    parse_status_line,
+    save_scan_start_offsets,
+)
 from experiment_data import ExperimentDataManager  # noqa: E402
 from experiment_resume_preview import load_experiment_preview  # noqa: E402
 from xy_eis_comp_cv_cycle import XYEISCompCVCycleWindow  # noqa: E402
@@ -33,6 +39,27 @@ from rectangular_scan_path import generate_rectangular_path  # noqa: E402
 
 
 class MotionProtocolTests(unittest.TestCase):
+    def test_scan_start_offsets_persist_and_invalid_files_fall_back(self):
+        with tempfile.TemporaryDirectory() as directory:
+            settings_path = pathlib.Path(directory) / "settings.json"
+            expected = {"X": 12.5, "Y": -3.25, "Z": 7.0}
+            save_scan_start_offsets(settings_path, expected)
+            self.assertEqual(load_scan_start_offsets(settings_path), expected)
+
+            settings_path.write_text('{"last_scan_start_mm":{"X":"bad"}}', encoding="utf-8")
+            self.assertEqual(
+                load_scan_start_offsets(settings_path),
+                {"X": 0.0, "Y": 0.0, "Z": 0.0},
+            )
+
+    def test_main_ui_saved_scan_return_is_sequential_and_requires_home(self):
+        source = (ROOT / "x_control.py").read_text(encoding="utf-8")
+        self.assertIn("Last Scan Zero from Home:", source)
+        self.assertIn("Home X, Y, and Z before returning", source)
+        self.assertIn("self.scan_start_return_axes = list(self.AXES)", source)
+        self.assertIn('line.startswith("EVENT,MOVE_DONE,")', source)
+        self.assertIn('self.send_command("MOVE {} {:.3f}".format(axis, distance))', source)
+
     def test_compact_status_expands_positions_limits_and_motion(self):
         values = parse_status_line(
             "STATUS,X=1.250,Y=-2.000,Z=0.006,SX=0.250,SY=-3.000,SZ=0.000,"

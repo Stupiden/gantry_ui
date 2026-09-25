@@ -1,6 +1,7 @@
 """Gantry motion, fluidics, Gamry measurement, and scan automation UI."""
 
 import gc
+import json
 from pathlib import Path
 import sys
 import struct
@@ -42,6 +43,39 @@ KEEPALIVE_MS = 250
 HANDSHAKE_RETRY_MS = 500
 CONTROLLER_BOOT_WAIT_MS = 2000
 MAX_RX_BUFFER_BYTES = 4096
+SCAN_START_SETTINGS_FILE = "gantry_ui_settings.json"
+
+
+def load_scan_start_offsets(path):
+    """Load the last Scan Zero machine coordinates, falling back safely."""
+    defaults = {axis: 0.0 for axis in ("X", "Y", "Z")}
+    try:
+        with Path(path).open("r", encoding="utf-8") as stream:
+            data = json.load(stream)
+        saved = data.get("last_scan_start_mm", {})
+        for axis in defaults:
+            value = float(saved[axis])
+            if not -1000.0 <= value <= 1000.0:
+                raise ValueError("saved offset is outside the motion range")
+            defaults[axis] = value
+    except (OSError, ValueError, TypeError, KeyError, json.JSONDecodeError):
+        pass
+    return defaults
+
+
+def save_scan_start_offsets(path, offsets):
+    """Persist editable Scan Zero offsets without leaving a partial file."""
+    path = Path(path)
+    data = {
+        "last_scan_start_mm": {
+            axis: float(offsets[axis]) for axis in ("X", "Y", "Z")
+        }
+    }
+    temporary_path = path.with_suffix(path.suffix + ".tmp")
+    with temporary_path.open("w", encoding="utf-8") as stream:
+        json.dump(data, stream, indent=2, sort_keys=True)
+        stream.write("\n")
+    temporary_path.replace(path)
 
 
 def parse_status_line(line):
@@ -163,6 +197,13 @@ class GantryMotionUI(tk.Tk):
             "automation_trace.log"
         )
         self.gamry_measurement_owner = None
+        self.scan_start_settings_path = Path(__file__).resolve().with_name(
+            SCAN_START_SETTINGS_FILE
+        )
+        saved_scan_start = load_scan_start_offsets(self.scan_start_settings_path)
+        self.scan_zero_save_pending = False
+        self.scan_start_return_axes = []
+        self.scan_start_return_offsets = {}
 
         self.port_var = tk.StringVar()
         self.connection_var = tk.StringVar(value="● DISCONNECTED")
@@ -177,6 +218,9 @@ class GantryMotionUI(tk.Tk):
         }
         self.scan_position_vars = {
             axis: tk.StringVar(value="0.000 mm") for axis in self.AXES
+        }
+        self.scan_start_offset_vars = {
+            axis: tk.DoubleVar(value=saved_scan_start[axis]) for axis in self.AXES
         }
         self.homed_vars = {
             axis: tk.StringVar(value="NOT HOMED") for axis in self.AXES
@@ -707,6 +751,30 @@ class GantryMotionUI(tk.Tk):
             row=2, column=0, columnspan=4, sticky="ew", padx=4, pady=(4, 0)
         )
 
+        saved_frame = ttk.Frame(frame)
+        saved_frame.grid(row=3, column=0, columnspan=4, sticky="ew", padx=4, pady=(4, 0))
+        ttk.Label(saved_frame, text="Last Scan Zero from Home:").grid(row=0, column=0)
+        for column, axis in enumerate(self.AXES, start=1):
+            ttk.Label(saved_frame, text=axis).grid(row=0, column=column * 2 - 1, padx=(7, 2))
+            offset_box = ttk.Spinbox(
+                saved_frame,
+                from_=-1000.0,
+                to=1000.0,
+                increment=0.1,
+                textvariable=self.scan_start_offset_vars[axis],
+                width=8,
+            )
+            offset_box.grid(row=0, column=column * 2)
+        save_button = ttk.Button(
+            saved_frame, text="SAVE", command=self.save_scan_start_offsets_from_ui
+        )
+        save_button.grid(row=0, column=7, padx=(8, 3))
+        return_button = ttk.Button(
+            saved_frame, text="RESTORE AFTER HOME", command=self.return_to_saved_scan_start
+        )
+        return_button.grid(row=0, column=8)
+        self.motion_widgets.append(return_button)
+
     def prepare_eis_cv_resume(self, preview, mode, selected_indices):
         if self.gamry_pstat is None:
             messagebox.showerror(
@@ -1213,6 +1281,8 @@ class GantryMotionUI(tk.Tk):
 
         self.controller_ready = False
         self.jog_axis = None
+        self.scan_zero_save_pending = False
+        self.scan_start_return_axes = []
         self.rx_buffer = b""
         self.last_handshake_attempt = 0.0
         self.serial_opened_at = time.monotonic()
@@ -1406,6 +1476,18 @@ class GantryMotionUI(tk.Tk):
             return
 
         if line.startswith("EVENT,") or line.startswith("ERROR,"):
+            if line.startswith("ERROR,") and self.scan_zero_save_pending:
+                self.scan_zero_save_pending = False
+            if self.scan_start_return_axes:
+                if line.startswith("ERROR,"):
+                    self.scan_start_return_axes = []
+                    self.status_var.set("Saved Scan Zero return stopped: {}".format(line))
+                elif line.startswith("EVENT,MOVE_DONE,"):
+                    finished_axis = line.rsplit(",", 1)[-1]
+                    expected_axis = self.scan_start_return_axes[0]
+                    if finished_axis == expected_axis:
+                        self.scan_start_return_axes.pop(0)
+                        self._move_next_scan_start_axis()
             resume_window = self._active_resume_listener()
             if self.xy_dry_run_window is not None and self.xy_dry_run_window.winfo_exists():
                 self.xy_dry_run_window.handle_controller_line(line)
@@ -1471,6 +1553,10 @@ class GantryMotionUI(tk.Tk):
             return
 
         if line.startswith("OK,"):
+            if line == "OK,SCAN_ZERO" and self.scan_zero_save_pending:
+                # The immediately following STATUS contains the exact accepted
+                # controller position; persist from that instead of button time.
+                self.scan_zero_save_pending = "await_status"
             self.status_var.set(line)
 
     def parse_status(self, line):
@@ -1498,6 +1584,16 @@ class GantryMotionUI(tk.Tk):
                 self.moving_vars[axis].set(
                     "MOVING" if values.get(moving_key, "0") == "1" else "IDLE"
                 )
+
+            if self.scan_zero_save_pending == "await_status":
+                accepted_offsets = {
+                    axis: float(values[axis]) for axis in self.AXES
+                }
+                for axis in self.AXES:
+                    self.scan_start_offset_vars[axis].set(accepted_offsets[axis])
+                self.scan_zero_save_pending = False
+                self._persist_scan_start_offsets(accepted_offsets)
+                self.status_var.set("Saved current Scan Zero relative to Home")
 
             for key in self.LIMITS:
                 self.update_limit(key, values.get(key, "0") == "1")
@@ -1639,7 +1735,68 @@ class GantryMotionUI(tk.Tk):
             self.send_command("HOME {}".format(axis))
 
     def set_scan_zero(self):
-        self.send_command("SCAN_ZERO")
+        self.scan_zero_save_pending = bool(self.send_command("SCAN_ZERO"))
+
+    def validated_scan_start_offsets(self):
+        offsets = {}
+        try:
+            for axis in self.AXES:
+                value = float(self.scan_start_offset_vars[axis].get())
+                if not -1000.0 <= value <= 1000.0:
+                    raise ValueError
+                offsets[axis] = value
+        except (tk.TclError, ValueError):
+            self.status_var.set("Saved Scan Zero X/Y/Z must be within ±1000 mm")
+            return None
+        return offsets
+
+    def _persist_scan_start_offsets(self, offsets):
+        try:
+            save_scan_start_offsets(self.scan_start_settings_path, offsets)
+        except OSError as error:
+            self.status_var.set("Could not save Scan Zero position: {}".format(error))
+            return False
+        return True
+
+    def save_scan_start_offsets_from_ui(self):
+        offsets = self.validated_scan_start_offsets()
+        if offsets is not None and self._persist_scan_start_offsets(offsets):
+            self.status_var.set("Saved edited Scan Zero position")
+
+    def return_to_saved_scan_start(self):
+        offsets = self.validated_scan_start_offsets()
+        if offsets is None:
+            return
+        if any(self.homed_vars[axis].get() != "HOMED" for axis in self.AXES):
+            self.status_var.set("Home X, Y, and Z before returning to saved Scan Zero")
+            return
+        if any(self.moving_vars[axis].get() != "IDLE" for axis in self.AXES):
+            self.status_var.set("Wait for current motion to finish")
+            return
+        self.scan_start_return_offsets = offsets
+        self.scan_start_return_axes = list(self.AXES)
+        self._move_next_scan_start_axis()
+
+    def _move_next_scan_start_axis(self):
+        while self.scan_start_return_axes:
+            axis = self.scan_start_return_axes[0]
+            current = self.current_machine_position()[self.AXES.index(axis)]
+            distance = self.scan_start_return_offsets[axis] - current
+            if abs(distance) < 0.0005:
+                self.scan_start_return_axes.pop(0)
+                continue
+            if not self.send_command("MOVE {} {:.3f}".format(axis, distance)):
+                self.scan_start_return_axes = []
+                self.status_var.set("Could not start saved Scan Zero return")
+                return
+            self.status_var.set(
+                "Returning to saved Scan Zero — moving {} to {:.3f} mm".format(
+                    axis, self.scan_start_return_offsets[axis]
+                )
+            )
+            return
+        self.status_var.set("Returned to saved position — restoring Scan Zero")
+        self.set_scan_zero()
 
     def validated_pump_speed(self, pump_id):
         try:
