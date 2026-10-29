@@ -95,7 +95,7 @@ class MotionProtocolTests(unittest.TestCase):
         self.assertEqual(window.cv_cycles_var.value, 1)
         self.assertEqual(window.cv_precharge_var.value, 0.0)
         self.assertEqual(window.cv_ie_range_var.value, "9 — 6mA")
-        self.assertTrue(window.pos_feed_var.value)
+        self.assertFalse(window.pos_feed_var.value)
         self.assertFalse(window.auto_ie_range_var.value)
         self.assertEqual(window.comp_fraction_var.value, 0.85)
         self.assertEqual(window.max_ru_var.value, 500.0)

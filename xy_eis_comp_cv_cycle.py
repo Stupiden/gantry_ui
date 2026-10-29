@@ -136,7 +136,7 @@ class XYEISCompCVCycleWindow(XYFullEISCycleWindow):
         self.cv_cycles_var.set(1)
         self.cv_precharge_var.set(0.0)
         self.cv_ie_range_var.set(ie_range_display(9, self.cv_ie_range_choices))
-        self.pos_feed_var.set(True)
+        self.pos_feed_var.set(False)
         self.auto_ie_range_var.set(False)
         self.comp_fraction_var.set(0.85)
         self.min_ru_var.set(0.01)
@@ -197,7 +197,7 @@ class XYEISCompCVCycleWindow(XYFullEISCycleWindow):
         self.cv_ie_range_var.set(
             ie_range_display(cv["ie_range"], self.cv_ie_range_choices)
         )
-        self.pos_feed_var.set(measurement.get("positive_feedback_enabled", True))
+        self.pos_feed_var.set(measurement.get("positive_feedback_enabled", False))
         self.auto_ie_range_var.set(cv.get("auto_ie_range", False))
         self._sync_ie_mode_controls()
         self.comp_fraction_var.set(measurement["compensation_fraction"])
