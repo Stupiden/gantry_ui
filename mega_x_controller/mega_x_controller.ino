@@ -5,16 +5,19 @@
   six limit inputs, dual-Y synchronized STEP pulses, X/Y homing to MINUS and
   Z homing to PLUS,
   independent machine/scan coordinates, dual-Y driver alarm interlock,
-  two fixed-direction peristaltic pumps, non-blocking ADS1220 force reading,
+  two independently reversible peristaltic pumps, non-blocking ADS1220 force reading,
   force-limited Z press/lift, and a serial watchdog.
 */
 
 #include <Arduino.h>
+#include <DHT.h>
 #include <SPI.h>
 #include <stdlib.h>
 #include <string.h>
 
-const char CONTROLLER_ID[] = "MEGA_GANTRY_M6";
+// Distinct identity prevents the updated UI from trusting older firmware
+// that lacks the independent 500 g Z interlock.
+const char CONTROLLER_ID[] = "MEGA_GANTRY_M6_SAFE500";
 
 const uint8_t X_STEP = 2;
 const uint8_t X_DIR = 3;
@@ -38,6 +41,8 @@ const uint8_t PUMP_OUT_STEP = 32;
 const uint8_t PUMP_OUT_DIR = 33;
 const uint8_t ADS1220_DRDY = 14;
 const uint8_t ADS1220_CS = 53;
+const uint8_t DHT_PIN = 26;
+const uint8_t DHT_TYPE = DHT11;
 
 const float STEPS_PER_MM = 160.0f;
 const float DEFAULT_SPEED_MM_S = 2.0f;
@@ -66,11 +71,17 @@ const float LOAD_CELL_CAL_SLOPE = 0.1165f;
 const float LOAD_CELL_CAL_INTERCEPT = -0.6286f;
 const uint8_t LOAD_CELL_FILTER_SAMPLES = 10;
 const uint8_t LOAD_CELL_TARE_SAMPLES = 30;
+// Stop a press if DRDY stops producing samples or the ADC repeats one RAW
+// value while Z moves.  Serial keepalives must never substitute for force data.
+const unsigned long LOAD_CELL_SAMPLE_TIMEOUT_MS = 500;
+const unsigned long LOAD_CELL_CHANGE_TIMEOUT_MS = 750;
 const float DEFAULT_PRESS_SPEED_MM_S = 0.25f;
 const float MIN_PRESS_SPEED_MM_S = 0.05f;
 const float MAX_PRESS_SPEED_MM_S = 0.50f;
 const float DEFAULT_PRESS_FORCE_G = 100.0f;
-const float MAX_PRESS_FORCE_G = 5000.0f;
+const float MAX_PRESS_FORCE_G = 500.0f;
+const float Z_FORCE_LIMIT_G = 500.0f;
+const float Z_FORCE_RESET_G = 475.0f;
 const float DEFAULT_PRESS_TRAVEL_MM = 20.0f;
 const float MAX_PRESS_TRAVEL_MM = 50.0f;
 const unsigned long STATUS_INTERVAL_MS = 100;
@@ -117,6 +128,7 @@ PumpState pumps[2] = {
     {PUMP_IN_STEP, PUMP_IN_DIR, DEFAULT_PUMP_RPM, false, false, 0},
     {PUMP_OUT_STEP, PUMP_OUT_DIR, DEFAULT_PUMP_RPM, false, false, 0},
 };
+DHT environmentSensor(DHT_PIN, DHT_TYPE);
 
 float speedMM = DEFAULT_SPEED_MM_S;
 AxisState *volatile activeAxis = NULL;
@@ -140,11 +152,15 @@ bool loadCellHasReading = false;
 bool loadCellTareActive = true;
 bool loadCellTared = false;
 float loadCellForceGrams = 0.0f;
+float loadCellInstantForceGrams = 0.0f;
+unsigned long lastLoadCellSampleMillis = 0;
+unsigned long lastLoadCellChangeMillis = 0;
 long pressStartSteps = 0;
 unsigned long pressLiftSteps = 0;
 float pressForceThresholdG = DEFAULT_PRESS_FORCE_G;
 float pressSpeedMM = DEFAULT_PRESS_SPEED_MM_S;
 bool pressCanLift = false;
+bool zForceOverloadLatched = false;
 volatile MotionMode completedMotionMode = MODE_IDLE;
 
 uint16_t timerPeriodForSpeed(float speedMMPerSecond);
@@ -183,9 +199,15 @@ void beginTare() {
   loadCellTareCount = 0;
   loadCellTareActive = true;
   loadCellTared = false;
+  loadCellInstantForceGrams = 0.0f;
 }
 
 void updateLoadCellReading(long raw) {
+  unsigned long now = millis();
+  if (!loadCellHasReading || raw != loadCellRaw) {
+    lastLoadCellChangeMillis = now;
+  }
+  lastLoadCellSampleMillis = now;
   loadCellRaw = raw;
   if (loadCellFilterCount < LOAD_CELL_FILTER_SAMPLES) {
     loadCellFilterBuffer[loadCellFilterIndex] = raw;
@@ -219,6 +241,9 @@ void updateLoadCellReading(long raw) {
     loadCellForceGrams =
         LOAD_CELL_CAL_SLOPE * (loadCellFilteredRaw - loadCellTareRaw) +
         LOAD_CELL_CAL_INTERCEPT;
+    loadCellInstantForceGrams =
+        LOAD_CELL_CAL_SLOPE * (loadCellRaw - loadCellTareRaw) +
+        LOAD_CELL_CAL_INTERCEPT;
   }
 }
 
@@ -226,6 +251,45 @@ void serviceLoadCell() {
   if (digitalRead(ADS1220_DRDY) != LOW) return;
   updateLoadCellReading(ads1220ReadData());
   ads1220Command(ADS1220_CMD_START);
+}
+
+const char *loadCellFault() {
+  if (!loadCellHasReading ||
+      millis() - lastLoadCellSampleMillis > LOAD_CELL_SAMPLE_TIMEOUT_MS) {
+    return "STALE";
+  }
+  if (millis() - lastLoadCellChangeMillis > LOAD_CELL_CHANGE_TIMEOUT_MS) {
+    return "FROZEN";
+  }
+  return NULL;
+}
+
+float zSafetyForceGrams() {
+  // The ordinary PRESS target uses a 10-sample filter.  The independent hard
+  // stop must also see the newest sample, before that filter catches up.
+  return loadCellInstantForceGrams > loadCellForceGrams
+             ? loadCellInstantForceGrams : loadCellForceGrams;
+}
+
+bool zDownwardSafetyReady() {
+  if (loadCellFault() != NULL || !loadCellTared || loadCellTareActive) {
+    Serial.println(F("ERROR,Z_LOAD_CELL_NOT_READY"));
+    return false;
+  }
+  if (zForceOverloadLatched || zSafetyForceGrams() >= Z_FORCE_LIMIT_G) {
+    Serial.println(F("ERROR,Z_FORCE_LIMIT_ACTIVE"));
+    return false;
+  }
+  return true;
+}
+
+void armZRecoveryIfOverloaded() {
+  // A later upward command is the only software recovery while force remains
+  // high.  The first threshold crossing has already stopped the prior move.
+  if (loadCellTared && loadCellFault() == NULL &&
+      zSafetyForceGrams() >= Z_FORCE_LIMIT_G) {
+    zForceOverloadLatched = true;
+  }
 }
 
 bool limitTriggered(uint8_t pin) {
@@ -354,7 +418,7 @@ void capturePressLiftDistance() {
 
 bool startPress(float forceThresholdG, float maxTravelMM,
                 float pressSpeedRequested) {
-  if (!loadCellHasReading || !loadCellTared || loadCellTareActive) {
+  if (loadCellFault() != NULL || !loadCellTared || loadCellTareActive) {
     Serial.println(F("ERROR,LOAD_CELL_NOT_READY"));
     return false;
   }
@@ -362,6 +426,7 @@ bool startPress(float forceThresholdG, float maxTravelMM,
     Serial.println(F("ERROR,FORCE_ALREADY_AT_THRESHOLD"));
     return false;
   }
+  if (!zDownwardSafetyReady()) return false;
   if (!movementAllowed(zAxis, -1)) {
     Serial.println(F("ERROR,LIMIT_BLOCKED,Z,ZMIN"));
     return false;
@@ -393,6 +458,8 @@ bool startLift(float requestedLiftMM = 0.0f, float requestedLiftSpeed = 0.0f) {
     Serial.println(F("ERROR,LIMIT_BLOCKED,Z,ZPLUS"));
     return false;
   }
+
+  armZRecoveryIfOverloaded();
 
   unsigned long steps = pressLiftSteps;
   if (requestedLiftMM > 0.0f) {
@@ -454,12 +521,11 @@ void applyPumpSpeed(uint8_t pumpId, float rpm) {
   interrupts();
 }
 
-void startPump(uint8_t pumpId) {
+void startPump(uint8_t pumpId, bool reverse = false) {
   if (pumpId > 1) return;
   stopPump(pumpId);
-  // Verified independent test: the negative direction is clockwise, which
-  // corresponds to DIR LOW for both installed pump drivers.
-  digitalWrite(pumps[pumpId].dirPin, LOW);
+  // Positive RPM is counter-clockwise; negative RUN RPM reverses direction.
+  digitalWrite(pumps[pumpId].dirPin, reverse ? LOW : HIGH);
   delayMicroseconds(DIR_SETUP_US);
 
   noInterrupts();
@@ -500,6 +566,8 @@ void startTimer(AxisState &axis) {
 }
 
 bool startJog(AxisState &axis, int8_t direction) {
+  if (axis.name == 'Z' && direction < 0 && !zDownwardSafetyReady()) return false;
+  if (axis.name == 'Z' && direction > 0) armZRecoveryIfOverloaded();
   if (!yMotionAllowed(axis)) {
     reportYAlarmBlocked();
     return false;
@@ -533,6 +601,8 @@ bool startRelativeMove(AxisState &axis, float distanceMM) {
     return false;
   }
   int8_t direction = signedSteps > 0 ? 1 : -1;
+  if (axis.name == 'Z' && direction < 0 && !zDownwardSafetyReady()) return false;
+  if (axis.name == 'Z' && direction > 0) armZRecoveryIfOverloaded();
   if (!movementAllowed(axis, direction)) {
     Serial.print(F("ERROR,LIMIT_BLOCKED,"));
     Serial.print(axis.name);
@@ -553,6 +623,7 @@ bool startRelativeMove(AxisState &axis, float distanceMM) {
 }
 
 bool startHome(AxisState &axis) {
+  if (axis.name == 'Z') armZRecoveryIfOverloaded();
   stopAll();
   if (axis.name == 'Z') pressCanLift = false;
 
@@ -741,15 +812,23 @@ void sendStatus(bool force) {
   Serial.print(F(",PO="));
   Serial.print(pumps[1].rpm, 2);
   Serial.print(F(",LC="));
-  Serial.print(loadCellHasReading ? 1 : 0);
+  Serial.print(loadCellHasReading &&
+                       millis() - lastLoadCellSampleMillis <= LOAD_CELL_SAMPLE_TIMEOUT_MS
+                   ? 1 : 0);
   Serial.print(F(",T="));
   Serial.print(loadCellTareActive ? 1 : 0);
+  Serial.print(F(",TR="));
+  Serial.print(loadCellTared ? 1 : 0);
+  Serial.print(F(",PL="));
+  Serial.print(pressCanLift ? 1 : 0);
   Serial.print(F(",R="));
   Serial.print(loadCellRaw);
   Serial.print(F(",FR="));
   Serial.print(loadCellFilteredRaw);
   Serial.print(F(",F="));
   Serial.print(loadCellTared ? loadCellForceGrams : 0.0f, 2);
+  Serial.print(F(",FI="));
+  Serial.print(loadCellTared ? loadCellInstantForceGrams : 0.0f, 2);
   Serial.print(F(",PR="));
   Serial.print(zAxis.mode == MODE_PRESS ? 1 : (zAxis.mode == MODE_LIFT ? 2 : 0));
   Serial.print(F(",PD="));
@@ -781,6 +860,21 @@ void processCommand(char *command) {
   if (strcmp(verb, "KEEPALIVE") == 0) return;
   if (strcmp(verb, "STATUS") == 0) {
     sendStatus(true);
+    return;
+  }
+  if (strcmp(verb, "ENV") == 0) {
+    // DHT timing briefly disables interrupts.  Never read it while an axis is
+    // moving so the evenly timed motion pulses remain untouched.
+    if (anyAxisMoving()) {
+      Serial.println(F("ENV,BUSY"));
+      return;
+    }
+    float temperatureC = environmentSensor.readTemperature();
+    float relativeHumidity = environmentSensor.readHumidity();
+    Serial.print(F("ENV,T="));
+    Serial.print(temperatureC, 1);
+    Serial.print(F(",RH="));
+    Serial.println(relativeHumidity, 1);
     return;
   }
   if (strcmp(verb, "STOP") == 0) {
@@ -846,6 +940,10 @@ void processCommand(char *command) {
     return;
   }
   if (strcmp(verb, "TARE") == 0) {
+    if (zAxis.mode != MODE_IDLE) {
+      Serial.println(F("ERROR,TARE_DURING_Z_MOTION"));
+      return;
+    }
     beginTare();
     Serial.println(F("OK,TARE_STARTED"));
     sendStatus(true);
@@ -864,6 +962,20 @@ void processCommand(char *command) {
       startPump(pumpId);
       Serial.print(F("OK,PUMP_START,"));
       Serial.println(pumpId);
+    } else if (strcmp(action, "RUN") == 0) {
+      float signedRpm;
+      if (!parseFloatStrict(strtok_r(NULL, " ", &savePointer), signedRpm) ||
+          !(fabs(signedRpm) >= MIN_PUMP_RPM &&
+            fabs(signedRpm) <= MAX_PUMP_RPM)) {
+        Serial.println(F("ERROR,BAD_PUMP_SPEED"));
+        return;
+      }
+      applyPumpSpeed(pumpId, fabs(signedRpm));
+      startPump(pumpId, signedRpm < 0.0f);
+      Serial.print(F("OK,PUMP_RUN,"));
+      Serial.print(pumpId);
+      Serial.print(',');
+      Serial.println(signedRpm, 2);
     } else if (strcmp(action, "STOP") == 0) {
       stopPump(pumpId);
       Serial.print(F("OK,PUMP_STOP,"));
@@ -999,6 +1111,7 @@ void readSerial() {
 
 void setup() {
   Serial.begin(115200);
+  environmentSensor.begin();
 
   TCCR1A = 0;
   TCCR1B = 0;
@@ -1039,11 +1152,12 @@ void setup() {
   pinMode(PUMP_OUT_STEP, OUTPUT);
   pinMode(PUMP_OUT_DIR, OUTPUT);
   pinMode(ADS1220_CS, OUTPUT);
-  pinMode(ADS1220_DRDY, INPUT);
+  // A disconnected DRDY wire must not float LOW and look like fresh data.
+  pinMode(ADS1220_DRDY, INPUT_PULLUP);
   digitalWrite(PUMP_IN_STEP, LOW);
   digitalWrite(PUMP_OUT_STEP, LOW);
-  digitalWrite(PUMP_IN_DIR, LOW);
-  digitalWrite(PUMP_OUT_DIR, LOW);
+  digitalWrite(PUMP_IN_DIR, HIGH);
+  digitalWrite(PUMP_OUT_DIR, HIGH);
   digitalWrite(ADS1220_CS, HIGH);
 
   SPI.begin();
@@ -1075,6 +1189,47 @@ void loop() {
   serviceLoadCell();
 
   AxisState *axis = activeAxis;
+  bool zMovingDownward = axis == &zAxis &&
+      (zAxis.mode == MODE_PRESS ||
+       ((zAxis.mode == MODE_JOG || zAxis.mode == MODE_MOVE) &&
+        zAxis.direction < 0));
+  if (zMovingDownward) {
+    const char *fault = loadCellFault();
+    if (fault != NULL || !loadCellTared || loadCellTareActive) {
+      bool wasPressing = zAxis.mode == MODE_PRESS;
+      stopAll();
+      if (wasPressing) {
+        capturePressLiftDistance();
+        stopAllPumps();
+      }
+      loadCellHasReading = false;
+      loadCellTared = false;
+      Serial.print(wasPressing ? F("EVENT,PRESS_SENSOR_FAULT_STOP,")
+                              : F("EVENT,Z_SENSOR_FAULT_STOP,"));
+      Serial.println(fault != NULL ? fault : "NOT_TARED");
+      sendStatus(true);
+      axis = NULL;
+    }
+  }
+
+  if (loadCellTared && loadCellFault() == NULL) {
+    if (zSafetyForceGrams() >= Z_FORCE_LIMIT_G && !zForceOverloadLatched) {
+      zForceOverloadLatched = true;
+      bool zWasMoving = axis == &zAxis;
+      bool wasPressing = zWasMoving && zAxis.mode == MODE_PRESS;
+      if (zWasMoving) {
+        stopAll();
+        if (wasPressing) capturePressLiftDistance();
+        stopAllPumps();
+        axis = NULL;
+      }
+      Serial.print(F("EVENT,Z_FORCE_LIMIT_STOP,"));
+      Serial.println(zSafetyForceGrams(), 2);
+      sendStatus(true);
+    } else if (zSafetyForceGrams() < Z_FORCE_RESET_G) {
+      zForceOverloadLatched = false;
+    }
+  }
   if (axis != NULL && axis->mode == MODE_PRESS && loadCellTared &&
       loadCellForceGrams >= pressForceThresholdG) {
     stopAll();

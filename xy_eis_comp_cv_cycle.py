@@ -8,7 +8,10 @@ import tkinter as tk
 from tkinter import messagebox, ttk
 
 from auto_cv_measurement import AutoCVMeasurement
-from automatic_live_plot import AutomaticLivePlot
+from automatic_live_plot import SeparateEISVoltammetryPlots
+from gamry_ie_range import choices as ie_range_choices
+from gamry_ie_range import display_value as ie_range_display
+from gamry_ie_range import enum_value as ie_range_enum
 from xy_full_eis_cycle import XYFullEISCycleWindow
 from xy_pump_cycle import XYPumpCycleWindow
 
@@ -50,24 +53,94 @@ class XYEISCompCVCycleWindow(XYFullEISCycleWindow):
         self.resume_trace_path = Path(__file__).resolve().with_name("automation_trace.log")
         self.cv_runner = AutoCVMeasurement(self, pstat, tkp)
         self.live_plot.destroy()
-        self.live_plot = AutomaticLivePlot(self, show_cv=True, show_eis=True)
-        self.cv_initial_var = tk.DoubleVar(value=0.0)
-        self.cv_apex1_var = tk.DoubleVar(value=0.0)
-        self.cv_apex2_var = tk.DoubleVar(value=0.0)
-        self.cv_final_var = tk.DoubleVar(value=0.0)
+        self.live_plot = SeparateEISVoltammetryPlots(self)
+        # Defaults from the latest user-provided EIS + CV setup screenshot.
+        self.pressed_stabilization_var.set(10.0)
+        self.ac_amplitude_var.set(0.040)
+        self.dc_bias_var.set(-1.0)
+        self.zmod_var.set(1000.0)
+        self.cv_initial_var = tk.DoubleVar(value=-0.9)
+        self.cv_apex1_var = tk.DoubleVar(value=-1.6)
+        self.cv_apex2_var = tk.DoubleVar(value=-0.9)
+        self.cv_final_var = tk.DoubleVar(value=-0.9)
         self.cv_scan_rate_var = tk.DoubleVar(value=0.10)
         self.cv_step_var = tk.DoubleVar(value=0.001)
-        self.cv_cycles_var = tk.IntVar(value=4)
-        self.cv_precharge_var = tk.DoubleVar(value=10.0)
-        self.cv_ie_range_var = tk.DoubleVar(value=10.0)
-        self.comp_fraction_var = tk.DoubleVar(value=0.85)
+        self.cv_cycles_var = tk.IntVar(value=3)
+        self.cv_precharge_var = tk.DoubleVar(value=0.0)
+        self.cv_ie_range_choices = ie_range_choices(self.pstat)
+        default_ie_range = ie_range_display(8, self.cv_ie_range_choices)
+        self.cv_ie_range_var = tk.StringVar(value=default_ie_range)
+        self.pos_feed_var = tk.BooleanVar(value=False)
+        self.auto_ie_range_var = tk.BooleanVar(value=True)
+        self.comp_fraction_var = tk.DoubleVar(value=0.0)
         self.min_ru_var = tk.DoubleVar(value=0.01)
         self.max_ru_var = tk.DoubleVar(value=10000.0)
         self.comp_widgets = []
+        # Keep the EIS+LSV subclass on its own defaults; this setup comes
+        # specifically from the user's EIS+CV screenshot.
+        if type(self) is XYEISCompCVCycleWindow:
+            self._apply_default_setup()
         self._build_comp_cv_controls()
         if resume_manager is not None:
             parent.register_resume_serial_listener(self)
             self._apply_resume_settings(resume_manager.data["settings"])
+
+    def _apply_default_setup(self):
+        """New-experiment defaults from the user's 2026-10-26 setup screenshot."""
+        self.speed_var.set(1.0)
+        self.dwell_var.set(1.0)
+        self.press_force_var.set(45.0)
+        self.press_travel_var.set(20.0)
+        self.press_speed_var.set(0.25)
+        self.lift_distance_var.set(1.7)
+        self.lift_speed_var.set(0.15)
+        self.press_pump_enabled_var.set(True)
+        self.press_pump_duration_var.set(1.5)
+        self.press_pump_rpm_vars[0].set(1.0)
+        self.press_pump_rpm_vars[1].set(0.0)
+        self.pump_enabled_vars[0].set(True)
+        self.pump_enabled_vars[1].set(True)
+        self.pump_rpm_vars[0].set(2.2)
+        self.pump_rpm_vars[1].set(2.1)
+        self.pump_duration_vars[0].set(2.0)
+        self.pump_duration_vars[1].set(2.0)
+        self.pressed_stabilization_var.set(10.0)
+        self.pre_lift_wait_var.set(1.0)
+        self.pump_start_interval_var.set(0.0)
+        self.suction_enabled_var.set(True)
+        self.suction_with_lift_var.set(True)
+        self.suction_rpm_vars[0].set(-1.0)
+        self.suction_rpm_vars[1].set(1.0)
+        self.suction_duration_vars[0].set(4.5)
+        self.suction_duration_vars[1].set(6.0)
+        self.suction_lift_delay_var.set(4.0)
+        self.frequencies_var.set("1000000, 300000, 170000, 100000, 30000")
+        self.repeats_var.set(3)
+        self.ac_amplitude_var.set(0.04)
+        self.dc_bias_var.set(-1.1)
+        self.gain_var.set(1.0)
+        self.zmod_var.set(1000.0)
+        self.passes_var.set(10)
+        self.cycles_delay_var.set(1)
+        self.settle_var.set(0.5)
+        self.max_phase_var.set(7.5)
+        self.z_bad_var.set(500.0)
+        self.min_bad_var.set(2)
+        self.max_eis_attempts_var.set(3)
+        self.cv_initial_var.set(-1.1)
+        self.cv_apex1_var.set(-1.5)
+        self.cv_apex2_var.set(-1.1)
+        self.cv_final_var.set(-1.1)
+        self.cv_scan_rate_var.set(0.1)
+        self.cv_step_var.set(0.001)
+        self.cv_cycles_var.set(1)
+        self.cv_precharge_var.set(0.0)
+        self.cv_ie_range_var.set(ie_range_display(9, self.cv_ie_range_choices))
+        self.pos_feed_var.set(True)
+        self.auto_ie_range_var.set(False)
+        self.comp_fraction_var.set(0.85)
+        self.min_ru_var.set(0.01)
+        self.max_ru_var.set(500.0)
 
     def _apply_resume_settings(self, settings):
         motion, press = settings["motion"], settings["press"]
@@ -82,12 +155,31 @@ class XYEISCompCVCycleWindow(XYFullEISCycleWindow):
         self.lift_speed_var.set(press["lift_speed_mm_s"])
         self.pressed_stabilization_var.set(settings["pressed_stabilization_s"])
         self.pre_lift_wait_var.set(settings["pre_lift_wait_s"])
+        self.max_eis_attempts_var.set(settings.get("max_eis_attempts", 3))
+        self.pump_start_interval_var.set(settings.get("pump_start_interval_s", 0.0))
+        press_pump = settings.get("press_pump", {})
+        self.press_pump_enabled_var.set(bool(press_pump.get("enabled", False)))
+        self.press_pump_duration_var.set(press_pump.get("duration_s", 0.5))
+        self.press_pump_rpm_vars[0].set(press_pump.get("in_rpm", 0.5))
+        self.press_pump_rpm_vars[1].set(press_pump.get("out_rpm", 0.5))
         enabled = {int(item["pump_id"]): item for item in settings["pumps"]}
         for pump_id in (0, 1):
             self.pump_enabled_vars[pump_id].set(pump_id in enabled)
             if pump_id in enabled:
                 self.pump_rpm_vars[pump_id].set(enabled[pump_id]["speed_rpm"])
                 self.pump_duration_vars[pump_id].set(enabled[pump_id]["post_measurement_s"])
+        suction = settings.get("suction", {})
+        self.suction_enabled_var.set(bool(suction.get("enabled", False)))
+        self.suction_with_lift_var.set(bool(suction.get("with_lift", False)))
+        self.suction_lift_delay_var.set(suction.get("lift_delay_s", 1.0))
+        if suction.get("enabled", False):
+            for duration_var in self.suction_duration_vars:
+                duration_var.set(0.0)
+        for item in suction.get("pumps", []):
+            pump_id = int(item["pump_id"])
+            if pump_id in (0, 1):
+                self.suction_rpm_vars[pump_id].set(item["signed_rpm"])
+                self.suction_duration_vars[pump_id].set(item["duration_s"])
         self.frequencies_var.set(", ".join(str(item) for item in eis["frequencies"]))
         for variable, key in ((self.repeats_var, "n_times"), (self.ac_amplitude_var, "ac_amplitude"),
                               (self.dc_bias_var, "dc_bias"), (self.gain_var, "gain"),
@@ -100,9 +192,14 @@ class XYEISCompCVCycleWindow(XYFullEISCycleWindow):
         for variable, key in ((self.cv_initial_var, "initial"), (self.cv_apex1_var, "apex1"),
                               (self.cv_apex2_var, "apex2"), (self.cv_final_var, "final"),
                               (self.cv_scan_rate_var, "scan_rate"), (self.cv_step_var, "step_size"),
-                              (self.cv_cycles_var, "cycles"), (self.cv_precharge_var, "precharge"),
-                              (self.cv_ie_range_var, "ie_range")):
+                              (self.cv_cycles_var, "cycles"), (self.cv_precharge_var, "precharge")):
             variable.set(cv[key])
+        self.cv_ie_range_var.set(
+            ie_range_display(cv["ie_range"], self.cv_ie_range_choices)
+        )
+        self.pos_feed_var.set(measurement.get("positive_feedback_enabled", True))
+        self.auto_ie_range_var.set(cv.get("auto_ie_range", False))
+        self._sync_ie_mode_controls()
         self.comp_fraction_var.set(measurement["compensation_fraction"])
         self.min_ru_var.set(measurement["min_ru_ohm"])
         self.max_ru_var.set(measurement["max_ru_ohm"])
@@ -123,12 +220,40 @@ class XYEISCompCVCycleWindow(XYFullEISCycleWindow):
             row = 24 + (index // 6) * 2
             column = index % 6
             ttk.Label(frame, text=label).grid(row=row, column=column, sticky="w", padx=5)
-            entry = ttk.Entry(frame, textvariable=variable, width=10)
+            if label == "CV IE range":
+                entry = ttk.Combobox(
+                    frame, textvariable=variable, values=self.cv_ie_range_choices,
+                    state="readonly", width=14
+                )
+                self.cv_ie_range_entry = entry
+            else:
+                entry = ttk.Entry(frame, textvariable=variable, width=10)
             entry.grid(row=row + 1, column=column, sticky="w", padx=5)
             self.comp_widgets.append(entry)
-        self.start_button.grid_configure(row=28)
+        self._build_ie_mode_controls(frame)
+        self.start_button.grid_configure(row=28, columnspan=1); self.restart_button.grid_configure(row=28)
         self.stop_button.grid_configure(row=28)
         self.start_button.configure(text="START EIS + COMPENSATED CV")
+
+    def _build_ie_mode_controls(self, frame):
+        self.pos_feed_check = ttk.Checkbutton(
+            frame, text="Enable PF", variable=self.pos_feed_var,
+            command=self._sync_ie_mode_controls,
+        )
+        self.pos_feed_check.grid(row=22, column=3, sticky="w", padx=5)
+        self.auto_ie_range_check = ttk.Checkbutton(
+            frame, text="Auto IE range (PF off)", variable=self.auto_ie_range_var,
+        )
+        self.auto_ie_range_check.grid(row=22, column=4, columnspan=2, sticky="w", padx=5)
+        self.comp_widgets.extend((self.pos_feed_check, self.auto_ie_range_check))
+        self._sync_ie_mode_controls()
+
+    def _sync_ie_mode_controls(self):
+        if self.pos_feed_var.get():
+            self.auto_ie_range_var.set(False)
+        self.auto_ie_range_check.configure(
+            state="disabled" if self.pos_feed_var.get() else "normal"
+        )
 
     def _comp_cv_parameters(self):
         try:
@@ -141,30 +266,38 @@ class XYEISCompCVCycleWindow(XYFullEISCycleWindow):
                 "step_size": float(self.cv_step_var.get()),
                 "cycles": int(self.cv_cycles_var.get()),
                 "precharge": float(self.cv_precharge_var.get()),
-                "ie_range": float(self.cv_ie_range_var.get()),
+                "ie_range": ie_range_enum(self.cv_ie_range_var.get()),
+                "auto_ie_range": bool(self.auto_ie_range_var.get()),
             }
-            fraction = float(self.comp_fraction_var.get())
+            positive_feedback = bool(self.pos_feed_var.get())
+            fraction = float(self.comp_fraction_var.get()) if positive_feedback else 0.0
             min_ru = float(self.min_ru_var.get())
             max_ru = float(self.max_ru_var.get())
         except (tk.TclError, ValueError):
             raise ValueError("CV compensation parameters must be numbers")
         if params["scan_rate"] <= 0 or params["step_size"] <= 0 or params["cycles"] < 1:
             raise ValueError("CV scan rate/step/cycles are invalid")
-        if params["precharge"] < 0 or params["ie_range"] <= 0:
+        if params["precharge"] < 0 or (not params["auto_ie_range"] and params["ie_range"] <= 0):
             raise ValueError("CV precharge/IE range are invalid")
-        if not 0.0 < fraction <= 0.95:
+        if positive_feedback and params["auto_ie_range"]:
+            raise ValueError("Auto IE range requires positive feedback to be OFF")
+        if positive_feedback and not 0.0 < fraction <= 0.95:
             raise ValueError("Ru compensation fraction must be > 0 and <= 0.95")
         if min_ru <= 0 or max_ru <= min_ru:
             raise ValueError("Ru limits are invalid")
         return params, fraction, min_ru, max_ru
 
     def start(self):
+        if self.running:
+            return
         if self.formal_alignment_state is not None:
             return
         try:
             self.cv_params, self.comp_fraction, self.min_ru, self.max_ru = self._comp_cv_parameters()
         except Exception as error:
             messagebox.showerror("EIS + compensated CV", str(error), parent=self)
+            return
+        if not self._confirm_clearance():
             return
         if self.resume_manager is not None and not self.formal_alignment_ready:
             if not self._begin_formal_alignment():
@@ -346,6 +479,7 @@ class XYEISCompCVCycleWindow(XYFullEISCycleWindow):
         if not self.running or self.press_state != "pressing":
             return
         self._cancel_resume_press_poll()
+        self._stop_press_pumps()
         self._resume_trace(
             "PRESS COMPLETE source={} peak={:.2f}".format(
                 source, self.resume_press_peak_force
@@ -566,7 +700,7 @@ class XYEISCompCVCycleWindow(XYFullEISCycleWindow):
             return
         ru = float(result["avg_ru"])
         if not math.isfinite(ru) or not self.min_ru <= ru <= self.max_ru:
-            self._finish("ABORTED — GetRu value {:.6g} Ω is outside limits; use manual LIFT".format(ru))
+            self._eis_error("GetRu value {:.6g} Ω is outside limits".format(ru))
             return
         resistance = ru * self.comp_fraction
         params = dict(self.cv_params)
@@ -581,11 +715,14 @@ class XYEISCompCVCycleWindow(XYFullEISCycleWindow):
             int(point["index"]), ru, stamp
         )
         self.press_state = "measuring_comp_cv"
-        self.status_var.set(
-            "Ru {:.6g} Ω — CV with {:.1f}% compensation ({:.6g} Ω) — pumps ON".format(
-                ru, self.comp_fraction * 100.0, resistance
+        if self.pos_feed_var.get():
+            self.status_var.set(
+                "Ru {:.6g} Ω — CV with {:.1f}% compensation ({:.6g} Ω) — pumps ON".format(
+                    ru, self.comp_fraction * 100.0, resistance
+                )
             )
-        )
+        else:
+            self.status_var.set("Ru {:.6g} Ω — CV without PF — pumps ON".format(ru))
         self.live_plot.clear_cv()
         try:
             self.cv_runner.start(
@@ -605,6 +742,7 @@ class XYEISCompCVCycleWindow(XYFullEISCycleWindow):
             "eis": self.eis_params,
             "cv": self.cv_params,
             "compensation_fraction": self.comp_fraction,
+            "positive_feedback_enabled": bool(self.pos_feed_var.get()),
             "min_ru_ohm": self.min_ru,
             "max_ru_ohm": self.max_ru,
         }
@@ -663,3 +801,5 @@ class XYEISCompCVCycleWindow(XYFullEISCycleWindow):
         if hasattr(self, "comp_widgets"):
             for widget in self.comp_widgets:
                 widget.configure(state="normal")
+            self.cv_ie_range_entry.configure(state="readonly")
+            self._sync_ie_mode_controls()

@@ -15,9 +15,9 @@ const int Z_PLUS  = 28;
 const float STEPS_PER_MM = 160.0;
 
 // Slow test
-const float SPEED_MM_S = 1.0;       // 1 mm/s
-const float ACCEL_MM_S2 = 1.0;      // 1 mm/s²
-const float MOVE_MM = 1.0;         // ±1 mm
+const float SPEED_MM_S = 4.0;       // 1 mm/s
+const float ACCEL_MM_S2 = 2.0;      // 1 mm/s²
+const float MOVE_MM = 10.0;         // ±1 mm
 
 AccelStepper zMotor(AccelStepper::DRIVER, Z_STEP, Z_DIR);
 

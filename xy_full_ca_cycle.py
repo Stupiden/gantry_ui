@@ -9,6 +9,9 @@ from tkinter import filedialog, messagebox, ttk
 from auto_ca_measurement import AutoCAMeasurement
 from automatic_live_plot import AutomaticLivePlot
 from experiment_data import ExperimentDataManager
+from gamry_ie_range import choices as ie_range_choices
+from gamry_ie_range import display_value as ie_range_display
+from gamry_ie_range import enum_value as ie_range_enum
 from xy_pump_cycle import XYPumpCycleWindow
 
 
@@ -31,7 +34,11 @@ class XYFullCACycleWindow(XYPumpCycleWindow):
         self.vstep1_var, self.tstep1_var = tk.DoubleVar(value=0.0), tk.DoubleVar(value=3.0)
         self.vstep2_var, self.tstep2_var = tk.DoubleVar(value=0.0), tk.DoubleVar(value=0.150)
         self.sample_period_var = tk.DoubleVar(value=0.005)
-        self.auto_ie_range_var, self.ie_range_var = tk.BooleanVar(value=True), tk.DoubleVar(value=10.0)
+        self.auto_ie_range_var = tk.BooleanVar(value=True)
+        self.ie_range_choices = ie_range_choices(self.pstat)
+        self.ie_range_var = tk.StringVar(
+            value=ie_range_display(8, self.ie_range_choices)
+        )
         self.output_dir_var = tk.StringVar(value=str(Path.cwd() / "auto_ca_data"))
         self.ca_widgets = []
         self._build_ca_controls()
@@ -49,7 +56,13 @@ class XYFullCACycleWindow(XYPumpCycleWindow):
         for index, (label, variable) in enumerate(specs):
             row, column = 16 + (index // 5) * 2, index % 5
             ttk.Label(frame, text=label).grid(row=row, column=column, sticky="w", padx=5)
-            entry = ttk.Entry(frame, textvariable=variable, width=10)
+            if label == "IE range":
+                entry = ttk.Combobox(
+                    frame, textvariable=variable, values=self.ie_range_choices,
+                    state="readonly", width=14
+                )
+            else:
+                entry = ttk.Entry(frame, textvariable=variable, width=10)
             entry.grid(row=row + 1, column=column, sticky="w", padx=5); self.ca_widgets.append(entry)
         auto = ttk.Checkbutton(frame, text="Auto IE range", variable=self.auto_ie_range_var)
         auto.grid(row=20, column=0, sticky="w", padx=5); self.ca_widgets.append(auto)
@@ -58,7 +71,7 @@ class XYFullCACycleWindow(XYPumpCycleWindow):
         output.grid(row=21, column=0, columnspan=4, sticky="ew", padx=5)
         browse = ttk.Button(frame, text="BROWSE", command=self._browse)
         browse.grid(row=21, column=4, padx=5); self.ca_widgets.extend((output, browse))
-        self.start_button.grid_configure(row=23); self.stop_button.grid_configure(row=23)
+        self.start_button.grid_configure(row=23, columnspan=1); self.restart_button.grid_configure(row=23); self.stop_button.grid_configure(row=23)
         self.start_button.configure(text="START FULL CA CYCLE")
 
     def _browse(self):
@@ -71,7 +84,8 @@ class XYFullCACycleWindow(XYPumpCycleWindow):
                 "vstep1": float(self.vstep1_var.get()), "tstep1": float(self.tstep1_var.get()),
                 "vstep2": float(self.vstep2_var.get()), "tstep2": float(self.tstep2_var.get()),
                 "sample_period": float(self.sample_period_var.get()),
-                "auto_ie_range": bool(self.auto_ie_range_var.get()), "ie_range": float(self.ie_range_var.get())}
+                "auto_ie_range": bool(self.auto_ie_range_var.get()),
+                "ie_range": ie_range_enum(self.ie_range_var.get())}
         except (tk.TclError, ValueError): raise ValueError("CA parameters must be numbers")
         if params["tinit"] < 0 or params["tstep1"] <= 0 or params["tstep2"] <= 0:
             raise ValueError("CA times are invalid")
@@ -81,15 +95,18 @@ class XYFullCACycleWindow(XYPumpCycleWindow):
         return params, folder
 
     def start(self):
+        if self.running:
+            return
         try: self.ca_params, self.output_dir = self._parameters()
         except Exception as error:
             messagebox.showerror("Full CA cycle", str(error), parent=self); return
         XYPumpCycleWindow.start(self)
         if not self.running: return
-        self.data_manager = ExperimentDataManager(
-            self.output_dir, "CA", self.path_name, self.points,
-            self._manifest_settings(self.ca_params)
-        )
+        if self.data_manager is None:
+            self.data_manager = ExperimentDataManager(
+                self.output_dir, "CA", self.path_name, self.points,
+                self._manifest_settings(self.ca_params)
+            )
         if self.claim_measurement is not None and not self.claim_measurement("AUTO_CA"):
             XYPumpCycleWindow.stop(self); return
         self.measurement_claimed = True
@@ -99,10 +116,10 @@ class XYFullCACycleWindow(XYPumpCycleWindow):
         self.after_id = None
         if not self.running: return
         self.press_state = "starting_pumps"
-        for pump_id, rpm, unused_duration in self.pump_configs:
-            if not self.send_command("PUMP SPEED {} {:.2f}".format(pump_id, rpm)) or not self.send_command("PUMP START {}".format(pump_id)):
-                self._finish("FAILED — pump start command was not sent"); return
-            self.running_pumps.add(pump_id)
+        self._start_selected_pumps(self._all_pumps_started_before_ca)
+
+    def _all_pumps_started_before_ca(self):
+        if not self.running: return
         self.pump_start_deadline = time.monotonic() + 5.0
         self.after_id = self.after(100, self._wait_pumps)
 
@@ -145,9 +162,7 @@ class XYFullCACycleWindow(XYPumpCycleWindow):
             if time.monotonic() >= self.pump_stop_deadline:
                 self._finish("ABORTED — pumps not confirmed stopped; use manual LIFT"); return
             self.after_id = self.after(100, self._start_lift_after_wait); return
-        self.press_state = "lifting"
-        if not self.send_command("LIFT {:.3f} {:.3f}".format(self.lift_distance, self.lift_speed)):
-            self._finish("FAILED — lift command was not sent after CA")
+        XYPumpCycleWindow._start_lift_after_wait(self)
 
     def _ca_error(self, error): self._finish("ABORTED — CA failed: {} — use manual LIFT".format(error))
     def stop(self):

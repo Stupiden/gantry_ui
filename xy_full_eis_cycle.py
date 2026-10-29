@@ -34,20 +34,24 @@ class XYFullEISCycleWindow(XYPumpCycleWindow):
         self.reported_pump_states = None
         self.pump_start_deadline = None
         self.pump_stop_deadline = None
+        self.max_eis_attempts_var = tk.IntVar(value=3)
+        self.eis_attempt_count = 0
+        self.consecutive_failed_points = 0
+        self.eis_failure_pending = None
         self.eis_runner = AutoEISMeasurement(self, pstat)
         self.live_plot = AutomaticLivePlot(self, show_eis=True)
 
         self.frequencies_var = tk.StringVar(value=DEFAULT_FREQUENCIES)
         self.repeats_var = tk.IntVar(value=3)
-        self.ac_amplitude_var = tk.DoubleVar(value=0.007)
-        self.dc_bias_var = tk.DoubleVar(value=0.0)
+        self.ac_amplitude_var = tk.DoubleVar(value=0.040)
+        self.dc_bias_var = tk.DoubleVar(value=-1.0)
         self.gain_var = tk.DoubleVar(value=1.0)
-        self.zmod_var = tk.DoubleVar(value=40.0)
+        self.zmod_var = tk.DoubleVar(value=1000.0)
         self.passes_var = tk.IntVar(value=10)
         self.cycles_delay_var = tk.IntVar(value=1)
         self.settle_var = tk.DoubleVar(value=0.5)
         self.max_phase_var = tk.DoubleVar(value=7.5)
-        self.z_bad_var = tk.DoubleVar(value=1000.0)
+        self.z_bad_var = tk.DoubleVar(value=10000.0)
         self.min_bad_var = tk.IntVar(value=2)
         self.output_dir_var = tk.StringVar(value=str(Path.cwd() / "auto_eis_data"))
         self.eis_widgets = []
@@ -74,6 +78,7 @@ class XYFullEISCycleWindow(XYPumpCycleWindow):
             ("Cycles delay", self.cycles_delay_var), ("Settle s", self.settle_var),
             ("Max phase °", self.max_phase_var), ("Bad Z Ω", self.z_bad_var),
             ("Min bad points", self.min_bad_var),
+            ("Max EIS attempts", self.max_eis_attempts_var),
         )
         for index, (label, variable) in enumerate(specs):
             row = 18 + (index // 6) * 2
@@ -90,7 +95,7 @@ class XYFullEISCycleWindow(XYPumpCycleWindow):
         browse = ttk.Button(frame, text="BROWSE", command=self._browse_output)
         browse.grid(row=23, column=5, padx=5)
         self.eis_widgets.extend((output_entry, browse))
-        self.start_button.grid_configure(row=24)
+        self.start_button.grid_configure(row=24, columnspan=1); self.restart_button.grid_configure(row=24)
         self.stop_button.grid_configure(row=24)
         self.start_button.configure(text="START FULL EIS CYCLE")
 
@@ -101,6 +106,7 @@ class XYFullEISCycleWindow(XYPumpCycleWindow):
 
     def _eis_parameters(self):
         try:
+            self.max_eis_attempts = int(self.max_eis_attempts_var.get())
             frequencies = [
                 float(item) for item in re.split(r"[,;\s]+", self.frequencies_var.get()) if item
             ]
@@ -120,6 +126,8 @@ class XYFullEISCycleWindow(XYPumpCycleWindow):
             }
         except (tk.TclError, ValueError):
             raise ValueError("EIS parameters must be numbers")
+        if not 1 <= self.max_eis_attempts <= 20:
+            raise ValueError("Max EIS attempts must be 1–20")
         if not frequencies or any(value <= 0 for value in frequencies):
             raise ValueError("Frequencies must contain positive numbers")
         if params["n_times"] < 1 or params["passes"] < 1:
@@ -135,6 +143,8 @@ class XYFullEISCycleWindow(XYPumpCycleWindow):
         return params, output_dir
 
     def start(self):
+        if self.running:
+            return
         try:
             self.eis_params, self.output_dir = self._eis_parameters()
         except Exception as error:
@@ -143,10 +153,14 @@ class XYFullEISCycleWindow(XYPumpCycleWindow):
         XYPumpCycleWindow.start(self)
         if not self.running:
             return
-        self.data_manager = ExperimentDataManager(
-            self.output_dir, self._experiment_method(), self.path_name,
-            self.points, self._manifest_settings(self._experiment_settings())
-        )
+        self.eis_attempt_count = 0
+        self.consecutive_failed_points = 0
+        self.eis_failure_pending = None
+        if self.data_manager is None:
+            self.data_manager = ExperimentDataManager(
+                self.output_dir, self._experiment_method(), self.path_name,
+                self.points, self._manifest_settings(self._experiment_settings())
+            )
         if self.claim_measurement is not None:
             if not self.claim_measurement("AUTO_EIS"):
                 XYPumpCycleWindow.stop(self)
@@ -164,19 +178,21 @@ class XYFullEISCycleWindow(XYPumpCycleWindow):
     def _experiment_settings(self):
         return self.eis_params
 
+    def _manifest_settings(self, measurement):
+        settings = XYPumpCycleWindow._manifest_settings(self, measurement)
+        settings["max_eis_attempts"] = self.max_eis_attempts
+        return settings
+
     def _start_pumps(self):
         self.after_id = None
         if not self.running:
             return
         self.press_state = "starting_pumps"
-        for pump_id, rpm, unused_duration in self.pump_configs:
-            if not self.send_command("PUMP SPEED {} {:.2f}".format(pump_id, rpm)):
-                self._finish("FAILED — pump speed command was not sent")
-                return
-            if not self.send_command("PUMP START {}".format(pump_id)):
-                self._finish("FAILED — pump start command was not sent")
-                return
-            self.running_pumps.add(pump_id)
+        self._start_selected_pumps(self._all_pumps_started_before_eis)
+
+    def _all_pumps_started_before_eis(self):
+        if not self.running:
+            return
         self.pump_start_deadline = time.monotonic() + 5.0
         self.after_id = self.after(100, self._wait_for_pumps_before_eis)
 
@@ -228,6 +244,7 @@ class XYFullEISCycleWindow(XYPumpCycleWindow):
     def _eis_complete(self, result):
         if not self.running:
             return
+        self.eis_failure_pending = None
         self.press_state = "post_eis_pumping"
         self.status_var.set(
             "EIS SAVED — Ru {:.6g} Ω — pumps remain ON".format(float(result["avg_ru"]))
@@ -252,12 +269,55 @@ class XYFullEISCycleWindow(XYPumpCycleWindow):
             self.after_id = self.after(100, self._start_lift_after_wait)
             return
         self.pump_stop_deadline = None
-        self.press_state = "lifting"
-        if not self.send_command("LIFT {:.3f} {:.3f}".format(self.lift_distance, self.lift_speed)):
-            self._finish("FAILED — lift command was not sent after EIS")
+        XYPumpCycleWindow._start_lift_after_wait(self)
 
     def _eis_error(self, error):
-        self._finish("ABORTED — EIS/GetRu failed: {} — use manual LIFT".format(error))
+        if not self.running or self.eis_failure_pending is not None:
+            return
+        self.eis_attempt_count += 1
+        self.eis_failure_pending = str(error)
+        self.press_state = "post_eis_failure_pumping"
+        self.status_var.set(
+            "EIS FAILED — attempt {}/{}; pumps remain ON for post-EIS run".format(
+                self.eis_attempt_count, self.max_eis_attempts
+            )
+        )
+        for pump_id, unused_rpm, duration in self.pump_configs:
+            self.pump_after_ids[pump_id] = self.after(
+                int(duration * 1000),
+                lambda selected_id=pump_id: self._pump_time_complete(selected_id),
+            )
+
+    def _complete_pressed_point(self):
+        if self.eis_failure_pending is None:
+            self.eis_attempt_count = 0
+            self.consecutive_failed_points = 0
+            return XYPumpCycleWindow._complete_pressed_point(self)
+
+        reason = "EIS/GetRu failed: {}".format(self.eis_failure_pending)
+        self.eis_failure_pending = None
+        self.data_manager.fail_active(reason)
+        point = self._current_target()
+        if self.eis_attempt_count < self.max_eis_attempts:
+            self.status_var.set(
+                "POINT {} — retrying EIS attempt {}/{}".format(
+                    point["index"], self.eis_attempt_count + 1, self.max_eis_attempts
+                )
+            )
+            self.after_id = self.after(100, self._arrived)
+            return
+
+        self.eis_attempt_count = 0
+        self.consecutive_failed_points += 1
+        self.point_offset += 1
+        self.completed_var.set("{} / {}".format(self.point_offset, len(self.points)))
+        if self.consecutive_failed_points >= 3:
+            self._finish("ABORTED — EIS failed at three consecutive points")
+        elif self.point_offset >= len(self.points):
+            self._finish("COMPLETE — last point skipped after EIS failures")
+        else:
+            self.status_var.set("POINT {} SKIPPED — moving to next point".format(point["index"]))
+            self.after_id = self.after(100, self._move_x)
 
     def stop(self):
         if self.eis_runner.running:

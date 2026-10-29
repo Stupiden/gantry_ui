@@ -11,6 +11,11 @@ import numpy as np
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 from matplotlib.figure import Figure
 
+from cv_plot_scale import autoscale_cv_axes
+from gamry_ie_range import choices as ie_range_choices
+from gamry_ie_range import display_value as ie_range_display
+from gamry_ie_range import enum_value as ie_range_enum
+
 
 def initialize_pstat_for_cv(pstat, tkp):
     """Mirror the verified initialization in MG400/pre_gamry_cv.py."""
@@ -36,6 +41,7 @@ def initialize_pstat_for_cv(pstat, tkp):
 
 class ManualCVWindow(tk.Toplevel):
     POLL_MS = 50
+    MEASUREMENT_NAME = "CV"
 
     def __init__(
         self, parent, pstat, tkp, position_provider,
@@ -62,19 +68,22 @@ class ManualCVWindow(tk.Toplevel):
         self.active_params = {}
         self.pos_feed_resistance = 0.0
 
-        self.initial_var = tk.DoubleVar(value=0.0)
-        self.apex1_var = tk.DoubleVar(value=0.0)
-        self.apex2_var = tk.DoubleVar(value=0.0)
-        self.final_var = tk.DoubleVar(value=0.0)
+        self.initial_var = tk.DoubleVar(value=-0.5)
+        self.apex1_var = tk.DoubleVar(value=-1.5)
+        self.apex2_var = tk.DoubleVar(value=-0.5)
+        self.final_var = tk.DoubleVar(value=-0.5)
         self.scan_rate_var = tk.DoubleVar(value=0.10)
         self.step_size_var = tk.DoubleVar(value=0.001)
         self.cycles_var = tk.IntVar(value=4)
-        self.precharge_var = tk.DoubleVar(value=10.0)
+        self.precharge_var = tk.DoubleVar(value=0.0)
         self.ru_var = tk.DoubleVar(value=0.0)
         self.ru_fraction_var = tk.DoubleVar(value=0.85)
         self.pos_feed_var = tk.BooleanVar(value=False)
         self.auto_ie_range_var = tk.BooleanVar(value=False)
-        self.ie_range_var = tk.DoubleVar(value=10.0)
+        self.ie_range_choices = ie_range_choices(self.pstat)
+        self.ie_range_var = tk.StringVar(
+            value=ie_range_display(10, self.ie_range_choices)
+        )
         self.csv_var = tk.StringVar(value=self._default_csv_path())
         self.status_var = tk.StringVar(value="READY")
 
@@ -131,8 +140,9 @@ class ManualCVWindow(tk.Toplevel):
         )
         self.auto_ie_range_check.grid(row=2, column=6, sticky="w", padx=(4, 6))
         ttk.Label(controls, text="IE range").grid(row=2, column=7, sticky="e")
-        self.ie_range_entry = ttk.Entry(
-            controls, textvariable=self.ie_range_var, width=8
+        self.ie_range_entry = ttk.Combobox(
+            controls, textvariable=self.ie_range_var,
+            values=self.ie_range_choices, state="readonly", width=14
         )
         self.ie_range_entry.grid(row=2, column=8, sticky="w", padx=(4, 0))
 
@@ -186,7 +196,7 @@ class ManualCVWindow(tk.Toplevel):
             "precharge": float(self.precharge_var.get()),
             "ru": float(self.ru_var.get()),
             "ru_fraction": float(self.ru_fraction_var.get()),
-            "ie_range": float(self.ie_range_var.get()),
+            "ie_range": ie_range_enum(self.ie_range_var.get()),
         }
         if values["scan_rate"] <= 0 or values["step_size"] <= 0:
             raise ValueError("Scan rate and step size must be greater than zero")
@@ -206,7 +216,7 @@ class ManualCVWindow(tk.Toplevel):
         try:
             params = self._parameters()
             if self.claim_measurement is not None:
-                if not self.claim_measurement("CV"):
+                if not self.claim_measurement(self.MEASUREMENT_NAME):
                     raise RuntimeError("Another Gamry measurement is already running")
                 self.measurement_claimed = True
             if not self.tkp.pstat_is_valid(self.pstat):
@@ -232,18 +242,12 @@ class ManualCVWindow(tk.Toplevel):
             self.pstat.set_pos_feed_enable(bool(self.pos_feed_var.get()))
 
             sample_time = params["step_size"] / params["scan_rate"]
-            self.signal = self.pstat.signal_r_up_dn_new(
-                [params["initial"], params["apex1"], params["apex2"], params["final"]],
-                [params["scan_rate"], params["scan_rate"], params["scan_rate"]],
-                [0.0, 0.0, 0.0],
-                sample_time,
-                params["cycles"],
-                self.tkp.PSTATMODE,
-            )
+            self.signal = self._create_signal(params, sample_time)
+            self._attach_signal(self.signal)
+
             # ToolkitPy signal wrappers must stay alive for the full run.  The
             # original MG400 blocking function naturally kept this local in
             # scope; this non-blocking UI stores it explicitly between polls.
-            self.pstat.set_signal_r_up_dn(self.signal)
             self.pstat.init_signal()
             self.curve = self.tkp.RcvCurve(self.pstat, 10000)
             self.position_snapshot = self.position_provider()
@@ -260,8 +264,18 @@ class ManualCVWindow(tk.Toplevel):
         except Exception as error:
             self._safe_hardware_off()
             self._release_measurement()
-            messagebox.showerror("CV start failed", str(error), parent=self)
+            messagebox.showerror("{} start failed".format(self.MEASUREMENT_NAME), str(error), parent=self)
             self.status_var.set("START FAILED: {}".format(error))
+
+    def _create_signal(self, params, sample_time):
+        return self.pstat.signal_r_up_dn_new(
+            [params["initial"], params["apex1"], params["apex2"], params["final"]],
+            [params["scan_rate"], params["scan_rate"], params["scan_rate"]],
+            [0.0, 0.0, 0.0], sample_time, params["cycles"], self.tkp.PSTATMODE,
+        )
+
+    def _attach_signal(self, signal):
+        self.pstat.set_signal_r_up_dn(signal)
 
     def _poll_cv(self):
         if not self.running:
@@ -276,7 +290,7 @@ class ManualCVWindow(tk.Toplevel):
                 self.curve.run(True)
                 self.curve_started = True
                 self.curve_started_at = time.monotonic()
-                self.status_var.set("CV RUNNING")
+                self.status_var.set("{} RUNNING".format(self.MEASUREMENT_NAME))
 
             data = self.curve.acq_data()
             if len(data) > self.last_point_count:
@@ -294,19 +308,20 @@ class ManualCVWindow(tk.Toplevel):
                 and self.last_point_count == 0
                 and time.monotonic() - self.curve_started_at < 2.0
             ):
-                self.status_var.set("CV STARTING — waiting for first point")
+                self.status_var.set("{} STARTING — waiting for first point".format(self.MEASUREMENT_NAME))
                 self.after(self.POLL_MS, self._poll_cv)
             elif self.last_point_count == 0:
                 raise RuntimeError(
-                    "CV ended without data (PSTAT valid={}, curve running={})".format(
+                    "{} ended without data (PSTAT valid={}, curve running={})".format(
+                        self.MEASUREMENT_NAME,
                         pstat_valid, curve_running
                     )
                 )
             else:
-                self._finish("CV COMPLETE — {} points".format(self.last_point_count))
+                self._finish("{} COMPLETE — {} points".format(self.MEASUREMENT_NAME, self.last_point_count))
         except Exception as error:
-            self._finish("CV ERROR: {}".format(error))
-            messagebox.showerror("CV error", str(error), parent=self)
+            self._finish("{} ERROR: {}".format(self.MEASUREMENT_NAME, error))
+            messagebox.showerror("{} error".format(self.MEASUREMENT_NAME), str(error), parent=self)
 
     def _append_csv(self, data):
         if data is None or len(data) == 0:
@@ -357,12 +372,10 @@ class ManualCVWindow(tk.Toplevel):
         names = list(data.dtype.names or ())
         if "vf" not in names or "im" not in names:
             raise ValueError("CV data is missing vf/im fields: {}".format(names))
-        self.line.set_data(
-            np.asarray(data["vf"], dtype=float),
-            np.asarray(data["im"], dtype=float),
-        )
-        self.axes.relim()
-        self.axes.autoscale_view()
+        voltage = np.asarray(data["vf"], dtype=float)
+        current = np.asarray(data["im"], dtype=float)
+        self.line.set_data(voltage, current)
+        autoscale_cv_axes(self.axes, voltage, current)
         self.canvas.draw_idle()
 
     def stop_cv(self):
@@ -373,7 +386,7 @@ class ManualCVWindow(tk.Toplevel):
                 self.curve.stop()
             except Exception:
                 pass
-        self._finish("CV STOPPED BY USER")
+        self._finish("{} STOPPED BY USER".format(self.MEASUREMENT_NAME))
 
     def _safe_hardware_off(self):
         try:
@@ -398,7 +411,7 @@ class ManualCVWindow(tk.Toplevel):
 
     def _release_measurement(self):
         if self.measurement_claimed and self.release_measurement is not None:
-            self.release_measurement("CV")
+            self.release_measurement(self.MEASUREMENT_NAME)
         self.measurement_claimed = False
 
     def _set_controls_running(self, running):

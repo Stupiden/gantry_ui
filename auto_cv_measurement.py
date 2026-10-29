@@ -40,19 +40,18 @@ class AutoCVMeasurement:
                 raise RuntimeError("PSTAT connection is not valid")
             self._call("set control mode", self.pstat.set_ctrl_mode, self.tkp.PSTATMODE)
             self._call("initialize PSTAT", initialize_pstat_for_cv, self.pstat, self.tkp)
-            self._call("disable auto IE range", self.pstat.set_ie_range_mode, False)
-            self._call("set IE range", self.pstat.set_ie_range, params["ie_range"])
             resistance = float(params.get("pos_feed_resistance", 0.0))
+            auto_ie_range = bool(params.get("auto_ie_range", False))
+            if auto_ie_range and resistance > 0.0:
+                raise ValueError("Auto IE range requires positive feedback to be OFF")
+            self._call("set IE range mode", self.pstat.set_ie_range_mode, auto_ie_range)
+            if not auto_ie_range:
+                self._call("set IE range", self.pstat.set_ie_range, params["ie_range"])
             self._call("set positive feedback resistance", self.pstat.set_pos_feed_resistance, resistance)
             self._call("set positive feedback", self.pstat.set_pos_feed_enable, resistance > 0.0)
             sample_time = params["step_size"] / params["scan_rate"]
-            self.signal = self._call(
-                "create CV signal", self.pstat.signal_r_up_dn_new,
-                [params["initial"], params["apex1"], params["apex2"], params["final"]],
-                [params["scan_rate"], params["scan_rate"], params["scan_rate"]],
-                [0.0, 0.0, 0.0], sample_time, params["cycles"], self.tkp.PSTATMODE,
-            )
-            self._call("attach CV signal", self.pstat.set_signal_r_up_dn, self.signal)
+            self.signal = self._create_signal(params, sample_time)
+            self._attach_signal(self.signal)
             self._call("initialize CV signal", self.pstat.init_signal)
             self.curve = self._call("create CV curve", self.tkp.RcvCurve, self.pstat, 10000)
             self.precharge_deadline = time.monotonic() + params["precharge"]
@@ -63,6 +62,17 @@ class AutoCVMeasurement:
             self._hardware_off()
             self.running = False
             raise
+
+    def _create_signal(self, params, sample_time):
+        return self._call(
+            "create CV signal", self.pstat.signal_r_up_dn_new,
+            [params["initial"], params["apex1"], params["apex2"], params["final"]],
+            [params["scan_rate"], params["scan_rate"], params["scan_rate"]],
+            [0.0, 0.0, 0.0], sample_time, params["cycles"], self.tkp.PSTATMODE,
+        )
+
+    def _attach_signal(self, signal):
+        self._call("attach CV signal", self.pstat.set_signal_r_up_dn, signal)
 
     @staticmethod
     def _call(stage, function, *args):
@@ -120,7 +130,7 @@ class AutoCVMeasurement:
                     "timestamp", "point_index", "scan_x_mm", "scan_y_mm",
                     "machine_x_mm", "machine_y_mm", "machine_z_mm",
                     "initial_v", "apex1_v", "apex2_v", "final_v",
-                    "scan_rate_v_s", "step_v", "cycles", "precharge_s", "ie_range",
+                    "scan_rate_v_s", "step_v", "cycles", "precharge_s", "ie_range", "auto_ie_range",
                     "ru_ohm", "compensation_fraction", "pos_feed_resistance_ohm",
                 ] + names)
             for row in data:
@@ -132,7 +142,7 @@ class AutoCVMeasurement:
                     self.params["apex2"], self.params["final"],
                     self.params["scan_rate"], self.params["step_size"],
                     self.params["cycles"], self.params["precharge"],
-                    self.params["ie_range"],
+                    self.params["ie_range"], int(bool(self.params.get("auto_ie_range", False))),
                     self.params.get("ru_ohm", 0.0),
                     self.params.get("compensation_fraction", 0.0),
                     self.params.get("pos_feed_resistance", 0.0),

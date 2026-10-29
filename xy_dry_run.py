@@ -22,7 +22,7 @@ class XYDryRunWindow(tk.Toplevel):
         self.position_provider = position_provider
         self.start_guard = start_guard
         self.lock_controls = lock_controls
-        self.speed_var = tk.DoubleVar(value=1.0)
+        self.speed_var = tk.DoubleVar(value=2.0)
         self.dwell_var = tk.DoubleVar(value=1.0)
         self.current_point_var = tk.StringVar(value="—")
         self.completed_var = tk.StringVar(value="0 / {}".format(len(self.points)))
@@ -30,6 +30,8 @@ class XYDryRunWindow(tk.Toplevel):
         self.status_var = tk.StringVar(value="READY — preview path loaded")
         self.running = False
         self.point_offset = 0
+        self.needs_lift_confirmation = False
+        self.data_manager = None
         self.awaiting_axis = None
         self.after_id = None
         self._build_ui()
@@ -64,7 +66,9 @@ class XYDryRunWindow(tk.Toplevel):
             row=5, column=0, columnspan=4, sticky="w", padx=5, pady=(8, 6)
         )
         self.start_button = ttk.Button(frame, text="START XY DRY RUN", command=self.start)
-        self.start_button.grid(row=6, column=0, columnspan=2, sticky="ew", padx=5, pady=5)
+        self.start_button.grid(row=6, column=0, columnspan=1, sticky="ew", padx=5, pady=5)
+        self.restart_button = ttk.Button(frame, text="RESTART", command=self.restart)
+        self.restart_button.grid(row=6, column=1, sticky="ew", padx=5, pady=5)
         self.stop_button = ttk.Button(
             frame, text="STOP", command=self.stop, state="disabled"
         )
@@ -72,6 +76,10 @@ class XYDryRunWindow(tk.Toplevel):
 
     def start(self):
         if self.running:
+            return
+        if any(getattr(getattr(self, name, None), "running", False)
+               for name in ("eis_runner", "cv_runner", "ca_runner")):
+            messagebox.showinfo("Automation", "Measurement is still stopping. Please wait before continuing.", parent=self)
             return
         try:
             speed = float(self.speed_var.get())
@@ -91,9 +99,13 @@ class XYDryRunWindow(tk.Toplevel):
             return
         if not self.points:
             return
+        if self.point_offset >= len(self.points):
+            messagebox.showinfo("Automation", "All points finished. Use RESTART to run again.", parent=self)
+            return
+        if not self._confirm_clearance():
+            return
 
         self.running = True
-        self.point_offset = 0
         self.awaiting_axis = None
         self.dwell_seconds = dwell
         self.lock_controls(True)
@@ -101,11 +113,37 @@ class XYDryRunWindow(tk.Toplevel):
         self.dwell_entry.configure(state="disabled")
         self.start_button.configure(state="disabled")
         self.stop_button.configure(state="normal")
+        self.restart_button.configure(state="disabled")
         if not self.send_command("SPEED {:.3f}".format(speed)):
             self._finish("FAILED — could not send speed")
             return
-        self.status_var.set("RUNNING — moving to point 1")
+        self.status_var.set("RUNNING — moving to point {}".format(self._current_target()["index"]))
         self.after_id = self.after(100, self._move_x)
+
+    def _confirm_clearance(self):
+        if self.needs_lift_confirmation:
+            if not messagebox.askyesno(
+                "Continue automation", "The interrupted point will be repeated.\n"
+                "Use manual LIFT first if needed. Is Z raised clear of the sample?", parent=self
+            ):
+                return False
+            self.needs_lift_confirmation = False
+        return True
+
+    def restart(self):
+        if self.running or getattr(self, "formal_alignment_state", None) is not None:
+            return
+        if not messagebox.askyesno(
+            "Restart automation", "Restart from the first point? Completed points will be measured again.\n"
+            "Existing measurement files will be kept.", parent=self
+        ):
+            return
+        self.point_offset = 0
+        self.data_manager = None
+        self.completed_var.set("0 / {}".format(len(self.points)))
+        self.current_point_var.set("—")
+        self.start_button.configure(text="START", state="normal")
+        self.status_var.set("READY — restart selected; press START")
 
     def _current_target(self):
         return self.points[self.point_offset]
@@ -198,7 +236,9 @@ class XYDryRunWindow(tk.Toplevel):
             self.lock_controls(False)
         self.speed_entry.configure(state="normal")
         self.dwell_entry.configure(state="normal")
-        self.start_button.configure(state="normal")
+        finished = self.point_offset >= len(self.points)
+        self.start_button.configure(text="COMPLETE" if finished else "CONTINUE", state="disabled" if finished else "normal")
+        self.restart_button.configure(state="normal")
         self.stop_button.configure(state="disabled")
         self.status_var.set(message)
 

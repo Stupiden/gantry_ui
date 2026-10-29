@@ -1,7 +1,10 @@
 """Gantry motion, fluidics, Gamry measurement, and scan automation UI."""
 
+import csv
 import gc
 import json
+import math
+from datetime import datetime
 from pathlib import Path
 import sys
 import struct
@@ -13,8 +16,10 @@ import serial
 import serial.tools.list_ports
 
 from gamry_cv_manual import ManualCVWindow
+from gamry_lsv_manual import ManualLSVWindow
 from gamry_ca_manual import ManualCAWindow
 from gamry_eis_manual import ManualEISWindow
+from manual_suck_lift import ManualSuckLiftWindow
 from circular_scan_path import CircularScanPathWindow
 from rectangular_scan_path import RectangularScanPathWindow
 from experiment_resume_preview import choose_and_show_experiment
@@ -25,6 +30,7 @@ from xy_pump_cycle import XYPumpCycleWindow
 from xy_full_cv_cycle import XYFullCVCycleWindow
 from xy_full_eis_cycle import XYFullEISCycleWindow
 from xy_eis_comp_cv_cycle import XYEISCompCVCycleWindow
+from xy_eis_comp_lsv_cycle import XYEISCompLSVCycleWindow
 from xy_full_ca_cycle import XYFullCACycleWindow
 
 try:
@@ -34,7 +40,7 @@ except ImportError:
 
 
 BAUD_RATE = 115200
-CONTROLLER_ID = "MEGA_GANTRY_M6"
+CONTROLLER_ID = "MEGA_GANTRY_M6_SAFE500"
 DEFAULT_SPEED_MM_S = 2.0
 DEFAULT_PUMP_RPM = 2.0
 SERIAL_POLL_MS = 20
@@ -76,6 +82,21 @@ def save_scan_start_offsets(path, offsets):
         json.dump(data, stream, indent=2, sort_keys=True)
         stream.write("\n")
     temporary_path.replace(path)
+
+
+def append_environment_record(path, record):
+    """Append one temperature/humidity observation to a simple CSV log."""
+    path = Path(path)
+    new_file = not path.exists()
+    fields = (
+        "timestamp", "elapsed_minutes", "temperature_c", "humidity_rh_percent",
+        "measurement_mode", "point_index", "x_mm", "y_mm", "z_mm",
+    )
+    with path.open("a", newline="", encoding="utf-8-sig") as stream:
+        writer = csv.DictWriter(stream, fieldnames=fields)
+        if new_file:
+            writer.writeheader()
+        writer.writerow({field: record.get(field, "") for field in fields})
 
 
 def parse_status_line(line):
@@ -180,6 +201,7 @@ class GantryMotionUI(tk.Tk):
         self.gamry_pstat = None
         self.gamry_toolkit_initialized = False
         self.cv_window = None
+        self.lsv_window = None
         self.ca_window = None
         self.eis_window = None
         self.circular_path_window = None
@@ -190,13 +212,22 @@ class GantryMotionUI(tk.Tk):
         self.xy_full_cv_window = None
         self.xy_full_eis_window = None
         self.xy_eis_cv_window = None
+        self.xy_eis_lsv_window = None
         self.xy_resume_window = None
         self.resume_serial_listeners = []
         self.xy_full_ca_window = None
+        self.manual_suck_lift_window = None
+        self.press_lift_available = False
         self.automation_trace_path = Path(__file__).resolve().with_name(
             "automation_trace.log"
         )
         self.gamry_measurement_owner = None
+        self.environment_interval_var = tk.IntVar(value=15)
+        self.environment_session_window = None
+        self.environment_log_path = None
+        self.environment_session_started = None
+        self.environment_next_due = 0.0
+        self.environment_request = None
         self.scan_start_settings_path = Path(__file__).resolve().with_name(
             SCAN_START_SETTINGS_FILE
         )
@@ -237,7 +268,7 @@ class GantryMotionUI(tk.Tk):
         self.load_cell_filtered_var = tk.StringVar(value="—")
         self.load_cell_force_var = tk.StringVar(value="— g")
         self.load_cell_status_var = tk.StringVar(value="WAITING")
-        self.press_force_var = tk.DoubleVar(value=100.0)
+        self.press_force_var = tk.DoubleVar(value=60.0)
         self.press_travel_var = tk.DoubleVar(value=20.0)
         self.press_speed_var = tk.DoubleVar(value=0.25)
         self.press_status_var = tk.StringVar(value="IDLE")
@@ -259,6 +290,7 @@ class GantryMotionUI(tk.Tk):
         self.protocol("WM_DELETE_WINDOW", self.on_close)
         self.after(SERIAL_POLL_MS, self.service_serial)
         self.after(PORT_REFRESH_MS, self.periodic_port_refresh)
+        self.after(1000, self.service_environment_log)
 
     def build_ui(self):
         self.columnconfigure(0, weight=1)
@@ -348,6 +380,25 @@ class GantryMotionUI(tk.Tk):
             frame, text="MANUAL EIS", command=self.open_eis_window, state="disabled"
         )
         self.eis_button.grid(row=1, column=7, padx=(5, 0), pady=(3, 0))
+        self.lsv_button = ttk.Button(
+            frame, text="MANUAL LSV", command=self.open_lsv_window, state="disabled"
+        )
+        self.lsv_button.grid(row=2, column=6, padx=(5, 0), pady=(3, 0))
+
+        ttk.Label(frame, text="Auto environment log:").grid(
+            row=2, column=0, padx=(0, 8), pady=(3, 0)
+        )
+        environment_interval = ttk.Spinbox(
+            frame,
+            values=tuple(range(15, 1441, 15)),
+            textvariable=self.environment_interval_var,
+            state="readonly",
+            width=8,
+        )
+        environment_interval.grid(row=2, column=1, sticky="w", pady=(3, 0))
+        ttk.Label(frame, text="minutes (15-minute steps)").grid(
+            row=2, column=1, sticky="w", padx=(75, 0), pady=(3, 0)
+        )
 
     def ensure_gamry_environment(self):
         if tkp is None:
@@ -370,8 +421,9 @@ class GantryMotionUI(tk.Tk):
 
     def _dispose_gamry_windows(self):
         window_names = (
-            "cv_window", "ca_window", "eis_window",
-            "xy_full_cv_window", "xy_full_eis_window", "xy_eis_cv_window", "xy_full_ca_window",
+            "cv_window", "lsv_window", "ca_window", "eis_window",
+            "xy_full_cv_window", "xy_full_eis_window", "xy_eis_cv_window",
+            "xy_eis_lsv_window", "xy_full_ca_window",
         )
         for name in window_names:
             window = getattr(self, name)
@@ -455,6 +507,7 @@ class GantryMotionUI(tk.Tk):
         self.gamry_detect_button.configure(state="disabled")
         self.gamry_device_box.configure(state="disabled")
         self.cv_button.configure(state="normal")
+        self.lsv_button.configure(state="normal")
         self.ca_button.configure(state="normal")
         self.eis_button.configure(state="normal")
         self.gamry_status_var.set("● CONNECTED")
@@ -465,6 +518,7 @@ class GantryMotionUI(tk.Tk):
         for window, name in (
             (self.xy_full_eis_window, "FULL EIS CYCLE"),
             (self.xy_eis_cv_window, "EIS + COMP CV CYCLE"),
+            (self.xy_eis_lsv_window, "EIS + COMP LSV CYCLE"),
             (self.xy_full_ca_window, "FULL CA CYCLE"),
         ):
             if window is not None and window.winfo_exists() and (
@@ -482,6 +536,9 @@ class GantryMotionUI(tk.Tk):
             return
         if self.cv_window is not None and self.cv_window.running:
             self.status_var.set("Stop CV before disconnecting Gamry")
+            return
+        if self.lsv_window is not None and self.lsv_window.running:
+            self.status_var.set("Stop LSV before disconnecting Gamry")
             return
         if self.ca_window is not None and self.ca_window.running:
             self.status_var.set("Stop CA before disconnecting Gamry")
@@ -505,6 +562,7 @@ class GantryMotionUI(tk.Tk):
         self.gamry_detect_button.configure(state="normal")
         self.gamry_device_box.configure(state="readonly")
         self.cv_button.configure(state="disabled")
+        self.lsv_button.configure(state="disabled")
         self.ca_button.configure(state="disabled")
         self.eis_button.configure(state="disabled")
         self.gamry_status_var.set("● DISCONNECTED")
@@ -538,6 +596,19 @@ class GantryMotionUI(tk.Tk):
             self.current_machine_position,
             self.claim_gamry_measurement,
             self.release_gamry_measurement,
+        )
+
+    def open_lsv_window(self):
+        if self.gamry_pstat is None:
+            self.status_var.set("Connect Gamry before opening manual LSV")
+            return
+        if self.lsv_window is not None and self.lsv_window.winfo_exists():
+            self.lsv_window.lift()
+            self.lsv_window.focus_force()
+            return
+        self.lsv_window = ManualLSVWindow(
+            self, self.gamry_pstat, tkp, self.current_machine_position,
+            self.claim_gamry_measurement, self.release_gamry_measurement,
         )
 
     def open_ca_window(self):
@@ -867,9 +938,14 @@ class GantryMotionUI(tk.Tk):
             self.circular_path_window.focus_force()
             return
         self.circular_path_window = CircularScanPathWindow(
-            self, self.open_xy_dry_run, self.open_xy_press_cycle,
-            self.open_xy_pump_cycle, self.open_xy_full_cv,
-            self.open_xy_full_eis, self.open_xy_eis_cv, self.open_xy_full_ca
+            self, dry_run_callback=self.open_xy_dry_run,
+            press_cycle_callback=self.open_xy_press_cycle,
+            pump_cycle_callback=self.open_xy_pump_cycle,
+            full_cv_callback=self.open_xy_full_cv,
+            full_eis_callback=self.open_xy_full_eis,
+            eis_cv_callback=self.open_xy_eis_cv,
+            eis_lsv_callback=self.open_xy_eis_lsv,
+            full_ca_callback=self.open_xy_full_ca,
         )
 
     def open_rectangular_path_window(self):
@@ -878,14 +954,23 @@ class GantryMotionUI(tk.Tk):
             self.rectangular_path_window.focus_force()
             return
         self.rectangular_path_window = RectangularScanPathWindow(
-            self, self.open_xy_dry_run, self.open_xy_press_cycle,
-            self.open_xy_pump_cycle, self.open_xy_full_cv,
-            self.open_xy_full_eis, self.open_xy_eis_cv, self.open_xy_full_ca
+            self, dry_run_callback=self.open_xy_dry_run,
+            press_cycle_callback=self.open_xy_press_cycle,
+            pump_cycle_callback=self.open_xy_pump_cycle,
+            full_cv_callback=self.open_xy_full_cv,
+            full_eis_callback=self.open_xy_full_eis,
+            eis_cv_callback=self.open_xy_eis_cv,
+            eis_lsv_callback=self.open_xy_eis_lsv,
+            full_ca_callback=self.open_xy_full_ca,
         )
 
     def xy_dry_run_guard(self):
         if not self.controller_ready:
             return False, "Connect the Mega controller first"
+        if (self.manual_suck_lift_window is not None
+                and self.manual_suck_lift_window.winfo_exists()
+                and self.manual_suck_lift_window.running):
+            return False, "Finish manual suck + lift before automation"
         if (
             self.xy_dry_run_window is not None
             and self.xy_dry_run_window.winfo_exists()
@@ -925,6 +1010,12 @@ class GantryMotionUI(tk.Tk):
             and self.xy_eis_cv_window.running
         ):
             return False, "An EIS + compensated CV cycle is already running"
+        if (
+            self.xy_eis_lsv_window is not None
+            and self.xy_eis_lsv_window.winfo_exists()
+            and self.xy_eis_lsv_window.running
+        ):
+            return False, "An EIS + compensated LSV cycle is already running"
         if self.xy_full_ca_window is not None and self.xy_full_ca_window.winfo_exists() and self.xy_full_ca_window.running:
             return False, "A full CA cycle is already running"
         if self.homed_vars["X"].get() != "HOMED" or self.homed_vars["Y"].get() != "HOMED":
@@ -943,6 +1034,38 @@ class GantryMotionUI(tk.Tk):
 
     def lock_for_xy_dry_run(self, locked):
         self.set_motion_enabled(not locked and self.controller_ready)
+
+    def manual_suck_lift_guard(self):
+        if not self.controller_ready:
+            return False, "Connect the Mega controller first"
+        for window in (
+            self.xy_dry_run_window, self.xy_press_cycle_window,
+            self.xy_pump_cycle_window, self.xy_full_cv_window,
+            self.xy_full_eis_window, self.xy_eis_cv_window,
+            self.xy_eis_lsv_window, self.xy_full_ca_window,
+        ):
+            if window is not None and window.winfo_exists() and window.running:
+                return False, "Stop the automatic cycle first"
+        if self.gamry_measurement_owner is not None:
+            return False, "Stop the Gamry measurement first"
+        if self.moving_vars["Z"].get() != "IDLE":
+            return False, "Wait for Z to stop first"
+        if any(value.get() != "STOPPED" for value in self.pump_status_vars):
+            return False, "Stop both pumps first"
+        if not self.press_lift_available:
+            return False, "No completed PRESS to lift; check controller status"
+        return True, ""
+
+    def open_manual_suck_lift(self):
+        if (self.manual_suck_lift_window is not None
+                and self.manual_suck_lift_window.winfo_exists()):
+            self.manual_suck_lift_window.lift()
+            self.manual_suck_lift_window.focus_force()
+            return
+        self.manual_suck_lift_window = ManualSuckLiftWindow(
+            self, self.send_command, self.manual_suck_lift_guard,
+            self.lock_for_xy_dry_run,
+        )
 
     def open_xy_dry_run(self, points, path_name):
         if self.xy_dry_run_window is not None and self.xy_dry_run_window.winfo_exists():
@@ -1028,6 +1151,25 @@ class GantryMotionUI(tk.Tk):
                 return
             self.xy_eis_cv_window.destroy()
         self.xy_eis_cv_window = XYEISCompCVCycleWindow(
+            self, points, path_name, self.send_command, self.current_scan_xy,
+            self.current_machine_position, self.xy_dry_run_guard,
+            self.lock_for_xy_dry_run, self.gamry_pstat, tkp,
+            self.claim_gamry_measurement, self.release_gamry_measurement,
+            homed_provider=self.xy_homed_state,
+            home_status_provider=self.xy_home_status,
+        )
+
+    def open_xy_eis_lsv(self, points, path_name):
+        if self.gamry_pstat is None:
+            self.status_var.set("Connect Gamry before opening EIS + Compensated LSV")
+            return
+        if self.xy_eis_lsv_window is not None and self.xy_eis_lsv_window.winfo_exists():
+            if self.xy_eis_lsv_window.running or self.xy_eis_lsv_window.eis_runner.running:
+                self.xy_eis_lsv_window.lift()
+                self.xy_eis_lsv_window.focus_force()
+                return
+            self.xy_eis_lsv_window.destroy()
+        self.xy_eis_lsv_window = XYEISCompLSVCycleWindow(
             self, points, path_name, self.send_command, self.current_scan_xy,
             self.current_machine_position, self.xy_dry_run_guard,
             self.lock_for_xy_dry_run, self.gamry_pstat, tkp,
@@ -1195,9 +1337,11 @@ class GantryMotionUI(tk.Tk):
         tare_button.grid(row=0, column=7)
         self.motion_widgets.append(tare_button)
 
-        ttk.Label(frame, text="Press force:").grid(row=1, column=0, pady=(5, 0))
+        ttk.Label(frame, text="Press force (actual ≈ set + 40 g):").grid(
+            row=1, column=0, pady=(5, 0)
+        )
         force_box = ttk.Spinbox(
-            frame, from_=0.1, to=5000.0, increment=1.0,
+            frame, from_=0.1, to=500.0, increment=1.0,
             textvariable=self.press_force_var, width=7
         )
         force_box.grid(row=1, column=1, sticky="w", pady=(5, 0))
@@ -1226,11 +1370,15 @@ class GantryMotionUI(tk.Tk):
         press_stop_button.grid(row=0, column=0, padx=(0, 3))
         lift_button.grid(row=0, column=1)
         ttk.Label(frame, textvariable=self.press_status_var).grid(
-            row=2, column=0, columnspan=8, sticky="w", pady=(4, 0)
+            row=2, column=0, columnspan=7, sticky="w", pady=(4, 0)
         )
+        suck_lift_button = ttk.Button(
+            frame, text="SUCK + LIFT", command=self.open_manual_suck_lift
+        )
+        suck_lift_button.grid(row=2, column=7, sticky="e", pady=(3, 0))
         self.motion_widgets.extend(
             (force_box, travel_box, speed_box, press_button,
-             press_stop_button, lift_button)
+             press_stop_button, lift_button, suck_lift_button)
         )
 
     def refresh_ports(self):
@@ -1296,6 +1444,9 @@ class GantryMotionUI(tk.Tk):
         self.status_var.set("Waiting for {}...".format(CONTROLLER_ID))
 
     def disconnect_serial(self, reason):
+        if (self.manual_suck_lift_window is not None
+                and self.manual_suck_lift_window.winfo_exists()):
+            self.manual_suck_lift_window.emergency_stopped()
         if self.xy_dry_run_window is not None and self.xy_dry_run_window.winfo_exists():
             self.xy_dry_run_window.emergency_stopped()
         if self.xy_press_cycle_window is not None and self.xy_press_cycle_window.winfo_exists():
@@ -1308,6 +1459,8 @@ class GantryMotionUI(tk.Tk):
             self.xy_full_eis_window.emergency_stopped()
         if self.xy_eis_cv_window is not None and self.xy_eis_cv_window.winfo_exists():
             self.xy_eis_cv_window.emergency_stopped()
+        if self.xy_eis_lsv_window is not None and self.xy_eis_lsv_window.winfo_exists():
+            self.xy_eis_lsv_window.emergency_stopped()
         if self.xy_full_ca_window is not None and self.xy_full_ca_window.winfo_exists():
             self.xy_full_ca_window.emergency_stopped()
         if self.is_serial_open():
@@ -1321,6 +1474,7 @@ class GantryMotionUI(tk.Tk):
                 pass
         self.serial_port = None
         self.controller_ready = False
+        self.press_lift_available = False
         self.jog_axis = None
         self.rx_buffer = b""
         self.serial_opened_at = 0.0
@@ -1444,6 +1598,100 @@ class GantryMotionUI(tk.Tk):
 
         self.after(SERIAL_POLL_MS, self.service_serial)
 
+    def _active_environment_window(self):
+        for window in (
+            self.xy_full_cv_window,
+            self.xy_full_eis_window,
+            self.xy_eis_cv_window,
+            self.xy_eis_lsv_window,
+            self.xy_full_ca_window,
+        ):
+            if window is None:
+                continue
+            try:
+                if window.winfo_exists() and window.running:
+                    manager = getattr(window, "data_manager", None)
+                    if manager is not None:
+                        return window
+            except tk.TclError:
+                continue
+        return None
+
+    def service_environment_log(self):
+        """Request sparse DHT readings only while an automatic test is active."""
+        try:
+            window = self._active_environment_window()
+            if window is None:
+                self.environment_session_window = None
+                self.environment_log_path = None
+                self.environment_session_started = None
+                self.environment_request = None
+                return
+
+            now = time.monotonic()
+            if window is not self.environment_session_window:
+                self.environment_session_window = window
+                self.environment_log_path = window.data_manager.root / "environment.csv"
+                self.environment_session_started = now
+                self.environment_next_due = now
+                self.environment_request = None
+
+            if self.environment_request is not None or now < self.environment_next_due:
+                return
+            if not self.controller_ready or any(
+                self.moving_vars[axis].get() != "IDLE" for axis in self.AXES
+            ):
+                return
+
+            manager = window.data_manager
+            machine_x, machine_y, machine_z = self.current_machine_position()
+            active_index = getattr(manager, "active_index", None)
+            self.environment_request = {
+                "timestamp": datetime.now().isoformat(timespec="seconds"),
+                "elapsed_minutes": round(
+                    (now - self.environment_session_started) / 60.0, 3
+                ),
+                "measurement_mode": manager.data.get("method", ""),
+                "point_index": "" if active_index is None else int(active_index),
+                "x_mm": machine_x,
+                "y_mm": machine_y,
+                "z_mm": machine_z,
+            }
+            if not self.send_command("ENV"):
+                self.environment_request = None
+        finally:
+            self.after(1000, self.service_environment_log)
+
+    def handle_environment_line(self, line):
+        if self.environment_request is None:
+            return
+        if line == "ENV,BUSY":
+            self.environment_request = None
+            self.environment_next_due = time.monotonic() + 5.0
+            return
+        try:
+            values = {}
+            for item in line.split(",")[1:]:
+                key, value = item.split("=", 1)
+                values[key] = float(value)
+            record = dict(self.environment_request)
+            record["temperature_c"] = (
+                "" if math.isnan(values["T"]) else values["T"]
+            )
+            record["humidity_rh_percent"] = (
+                "" if math.isnan(values["RH"]) else values["RH"]
+            )
+            append_environment_record(self.environment_log_path, record)
+            interval_minutes = int(self.environment_interval_var.get())
+            self.environment_next_due = (
+                time.monotonic() + interval_minutes * 60.0
+            )
+        except (OSError, KeyError, ValueError, tk.TclError) as error:
+            self.status_var.set("Environment log warning: {}".format(error))
+            self.environment_next_due = time.monotonic() + 60.0
+        finally:
+            self.environment_request = None
+
     def handle_serial_line(self, line):
         trace_line = self._resume_trace_active() and line.startswith(("EVENT,", "ERROR,"))
         if self._resume_trace_active() and line.startswith("STATUS,") and any(
@@ -1469,13 +1717,26 @@ class GantryMotionUI(tk.Tk):
                 self.status_var.set("Controller ready")
             return
 
+        if line.startswith(("READY,", "IDENTITY,")) and not self.controller_ready:
+            self.connection_var.set("● FIRMWARE MISMATCH")
+            self.connection_label.configure(fg="#b00020")
+            self.status_var.set("Flash the SAFE500 Mega firmware before using motion")
+            return
+
         if line.startswith("STATUS,"):
             self.parse_status(line)
             if trace_line:
                 self._trace_automation("AFTER STATUS | {}".format(self._automation_snapshot()))
             return
 
+        if line.startswith("ENV,"):
+            self.handle_environment_line(line)
+            return
+
         if line.startswith("EVENT,") or line.startswith("ERROR,"):
+            if (self.manual_suck_lift_window is not None
+                    and self.manual_suck_lift_window.winfo_exists()):
+                self.manual_suck_lift_window.handle_controller_line(line)
             if line.startswith("ERROR,") and self.scan_zero_save_pending:
                 self.scan_zero_save_pending = False
             if self.scan_start_return_axes:
@@ -1505,6 +1766,8 @@ class GantryMotionUI(tk.Tk):
                 and self.xy_eis_cv_window.winfo_exists()
             ):
                 self.xy_eis_cv_window.handle_controller_line(line)
+            if self.xy_eis_lsv_window is not None and self.xy_eis_lsv_window.winfo_exists():
+                self.xy_eis_lsv_window.handle_controller_line(line)
             if (
                 resume_window is not None
                 and resume_window.winfo_exists()
@@ -1529,6 +1792,12 @@ class GantryMotionUI(tk.Tk):
                 self.press_status_var.set("STOPPED — MAX TRAVEL")
             elif line.startswith("EVENT,PRESS_LIMIT_STOP"):
                 self.press_status_var.set("STOPPED — Z LIMIT")
+            elif line.startswith("EVENT,PRESS_SENSOR_FAULT_STOP"):
+                self.press_status_var.set("STOPPED — LOAD-CELL SENSOR FAULT")
+            elif line.startswith("EVENT,Z_FORCE_LIMIT_STOP"):
+                self.press_status_var.set("STOPPED — Z FORCE ≥500 g; lift upward only")
+            elif line.startswith("EVENT,Z_SENSOR_FAULT_STOP"):
+                self.press_status_var.set("STOPPED — Z LOAD-CELL SENSOR FAULT")
             elif line.startswith("EVENT,LIFT_DONE"):
                 self.press_status_var.set("LIFT COMPLETE")
             elif line.startswith("ERROR,LOAD_CELL_NOT_READY"):
@@ -1543,6 +1812,12 @@ class GantryMotionUI(tk.Tk):
                 self.press_status_var.set("PRESS REJECTED — BAD PARAMETERS")
             elif line.startswith("ERROR,NO_PRESS_TO_LIFT"):
                 self.press_status_var.set("LIFT REJECTED — NO PRESS DISTANCE")
+            elif line.startswith("ERROR,Z_FORCE_LIMIT_ACTIVE"):
+                self.press_status_var.set("Z DOWN BLOCKED — FORCE ≥500 g")
+            elif line.startswith("ERROR,Z_LOAD_CELL_NOT_READY"):
+                self.press_status_var.set("Z DOWN BLOCKED — LOAD CELL NOT READY")
+            elif line.startswith("ERROR,TARE_DURING_Z_MOTION"):
+                self.load_cell_status_var.set("TARE REJECTED — Z MOVING")
             if (
                 "STOP" in line
                 or "LIMIT" in line
@@ -1562,6 +1837,7 @@ class GantryMotionUI(tk.Tk):
     def parse_status(self, line):
         try:
             values = parse_status_line(line)
+            self.press_lift_available = values.get("PL") == "1"
             resume_window = self._active_resume_listener()
 
             for axis in self.AXES:
@@ -1610,15 +1886,18 @@ class GantryMotionUI(tk.Tk):
                 self.load_cell_filtered_var.set(values["FR"])
                 self.load_cell_force_var.set("{:.2f} g".format(float(values["F"])))
                 self.load_cell_status_var.set(
-                    "TARING" if values["T"] == "1" else "READY"
+                    "OVERLOAD ≥500 g" if float(values.get("FI", values["F"])) >= 500.0 else
+                    "TARING" if values["T"] == "1" else
+                    "RE-TARE REQUIRED" if values.get("TR") == "0" else "READY"
                 )
             else:
-                self.load_cell_status_var.set("WAITING")
+                self.load_cell_raw_var.set("—")
+                self.load_cell_filtered_var.set("—")
+                self.load_cell_force_var.set("— g")
+                self.load_cell_status_var.set("NO FRESH DATA")
             press_state = values["PR"]
             if press_state == "1":
-                self.press_status_var.set(
-                    "PRESSING — {:.3f} mm".format(float(values["PD"]))
-                )
+                self.press_status_var.set("PRESSING")
             elif press_state == "2":
                 self.press_status_var.set("LIFTING")
             else:
@@ -1644,6 +1923,8 @@ class GantryMotionUI(tk.Tk):
                 and self.xy_eis_cv_window.winfo_exists()
             ):
                 self.xy_eis_cv_window.handle_status(values)
+            if self.xy_eis_lsv_window is not None and self.xy_eis_lsv_window.winfo_exists():
+                self.xy_eis_lsv_window.handle_status(values)
             if (
                 resume_window is not None
                 and resume_window.winfo_exists()
@@ -1659,6 +1940,9 @@ class GantryMotionUI(tk.Tk):
                     )
             if self.xy_full_ca_window is not None and self.xy_full_ca_window.winfo_exists():
                 self.xy_full_ca_window.handle_status(values)
+            if (self.manual_suck_lift_window is not None
+                    and self.manual_suck_lift_window.winfo_exists()):
+                self.manual_suck_lift_window.handle_status(values)
         except (KeyError, ValueError):
             self.status_var.set("Invalid STATUS: {}".format(line))
 
@@ -1836,8 +2120,8 @@ class GantryMotionUI(tk.Tk):
         except (tk.TclError, ValueError):
             self.status_var.set("Press parameters must be numbers")
             return None
-        if not 0.0 < force <= 5000.0:
-            self.status_var.set("Press force must be within 0–5000 g")
+        if not 0.0 < force <= 500.0:
+            self.status_var.set("Press force must be within 0–500 g")
             return None
         if not 0.0 < travel <= 50.0:
             self.status_var.set("Press travel must be within 0–50 mm")
@@ -1848,6 +2132,11 @@ class GantryMotionUI(tk.Tk):
         return force, travel, speed
 
     def start_press(self):
+        if (self.manual_suck_lift_window is not None
+                and self.manual_suck_lift_window.winfo_exists()
+                and self.manual_suck_lift_window.running):
+            self.press_status_var.set("PRESS REJECTED — suck + lift is running")
+            return
         parameters = self.validated_press_parameters()
         if parameters is None:
             return
@@ -1858,12 +2147,24 @@ class GantryMotionUI(tk.Tk):
         )
 
     def stop_press(self):
+        if (self.manual_suck_lift_window is not None
+                and self.manual_suck_lift_window.winfo_exists()
+                and self.manual_suck_lift_window.running):
+            self.manual_suck_lift_window.stop()
+            return
         self.send_command("MOTION_STOP")
 
     def lift_press(self):
+        if (self.manual_suck_lift_window is not None
+                and self.manual_suck_lift_window.winfo_exists()
+                and self.manual_suck_lift_window.running):
+            return
         self.send_command("LIFT")
 
     def emergency_stop(self):
+        if (self.manual_suck_lift_window is not None
+                and self.manual_suck_lift_window.winfo_exists()):
+            self.manual_suck_lift_window.emergency_stopped()
         if self.xy_dry_run_window is not None and self.xy_dry_run_window.winfo_exists():
             self.xy_dry_run_window.emergency_stopped()
         if self.xy_press_cycle_window is not None and self.xy_press_cycle_window.winfo_exists():
@@ -1876,10 +2177,14 @@ class GantryMotionUI(tk.Tk):
             self.xy_full_eis_window.emergency_stopped()
         if self.xy_eis_cv_window is not None and self.xy_eis_cv_window.winfo_exists():
             self.xy_eis_cv_window.emergency_stopped()
+        if self.xy_eis_lsv_window is not None and self.xy_eis_lsv_window.winfo_exists():
+            self.xy_eis_lsv_window.emergency_stopped()
         if self.xy_full_ca_window is not None and self.xy_full_ca_window.winfo_exists():
             self.xy_full_ca_window.emergency_stopped()
         if self.cv_window is not None and self.cv_window.winfo_exists():
             self.cv_window.stop_cv()
+        if self.lsv_window is not None and self.lsv_window.winfo_exists():
+            self.lsv_window.stop_cv()
         if self.ca_window is not None and self.ca_window.winfo_exists():
             self.ca_window.stop_ca()
         if self.eis_window is not None and self.eis_window.winfo_exists():
@@ -1889,6 +2194,9 @@ class GantryMotionUI(tk.Tk):
         self.status_var.set("STOP sent")
 
     def on_close(self):
+        if (self.manual_suck_lift_window is not None
+                and self.manual_suck_lift_window.winfo_exists()):
+            self.manual_suck_lift_window.stop()
         if self.xy_dry_run_window is not None and self.xy_dry_run_window.winfo_exists():
             self.xy_dry_run_window.stop()
         if self.xy_press_cycle_window is not None and self.xy_press_cycle_window.winfo_exists():
@@ -1901,6 +2209,8 @@ class GantryMotionUI(tk.Tk):
             self.xy_full_eis_window.stop()
         if self.xy_eis_cv_window is not None and self.xy_eis_cv_window.winfo_exists():
             self.xy_eis_cv_window.stop()
+        if self.xy_eis_lsv_window is not None and self.xy_eis_lsv_window.winfo_exists():
+            self.xy_eis_lsv_window.stop()
         if self.xy_full_ca_window is not None and self.xy_full_ca_window.winfo_exists():
             self.xy_full_ca_window.stop()
         if (
@@ -1919,6 +2229,14 @@ class GantryMotionUI(tk.Tk):
             self.status_var.set("Waiting for GetRu to stop safely before closing")
             self.after(250, self.on_close)
             return
+        if (
+            self.xy_eis_lsv_window is not None
+            and self.xy_eis_lsv_window.winfo_exists()
+            and self.xy_eis_lsv_window.eis_runner.running
+        ):
+            self.status_var.set("Waiting for GetRu + LSV to stop safely before closing")
+            self.after(250, self.on_close)
+            return
         if self.eis_window is not None and self.eis_window.winfo_exists():
             if self.eis_window.running:
                 self.eis_window.close_pending = True
@@ -1928,6 +2246,8 @@ class GantryMotionUI(tk.Tk):
                 return
         if self.cv_window is not None and self.cv_window.winfo_exists():
             self.cv_window.shutdown()
+        if self.lsv_window is not None and self.lsv_window.winfo_exists():
+            self.lsv_window.shutdown()
         if self.ca_window is not None and self.ca_window.winfo_exists():
             self.ca_window.shutdown()
         if self.eis_window is not None and self.eis_window.winfo_exists():

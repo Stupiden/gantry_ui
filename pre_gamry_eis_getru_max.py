@@ -650,7 +650,7 @@ class GamryEIS:
         dc_settle_s: float = _DC_SETTLE_S,
         ru_fraction_for_pos_feed=None,
         enable_pos_feed=None,
-        z_bad_threshold_ohm: float = 3000.0,
+        z_bad_threshold_ohm: float = 10000.0,
         min_bad_points: int = 3,
     ) -> dict:
         """

@@ -9,6 +9,9 @@ from tkinter import filedialog, messagebox, ttk
 from auto_cv_measurement import AutoCVMeasurement
 from automatic_live_plot import AutomaticLivePlot
 from experiment_data import ExperimentDataManager
+from gamry_ie_range import choices as ie_range_choices
+from gamry_ie_range import display_value as ie_range_display
+from gamry_ie_range import enum_value as ie_range_enum
 from xy_pump_cycle import XYPumpCycleWindow
 
 
@@ -36,15 +39,19 @@ class XYFullCVCycleWindow(XYPumpCycleWindow):
         self.cv_runner = AutoCVMeasurement(self, pstat, tkp)
         self.live_plot = AutomaticLivePlot(self, show_cv=True)
 
-        self.cv_initial_var = tk.DoubleVar(value=0.0)
-        self.cv_apex1_var = tk.DoubleVar(value=0.0)
-        self.cv_apex2_var = tk.DoubleVar(value=0.0)
-        self.cv_final_var = tk.DoubleVar(value=0.0)
+        self.cv_initial_var = tk.DoubleVar(value=-0.9)
+        self.cv_apex1_var = tk.DoubleVar(value=-1.6)
+        self.cv_apex2_var = tk.DoubleVar(value=-0.9)
+        self.cv_final_var = tk.DoubleVar(value=-0.9)
         self.cv_scan_rate_var = tk.DoubleVar(value=0.10)
         self.cv_step_var = tk.DoubleVar(value=0.001)
-        self.cv_cycles_var = tk.IntVar(value=4)
-        self.cv_precharge_var = tk.DoubleVar(value=10.0)
-        self.cv_ie_range_var = tk.DoubleVar(value=10.0)
+        self.cv_cycles_var = tk.IntVar(value=3)
+        self.cv_precharge_var = tk.DoubleVar(value=0.0)
+        self.cv_ie_range_choices = ie_range_choices(self.pstat)
+        self.cv_ie_range_var = tk.StringVar(
+            value=ie_range_display(8, self.cv_ie_range_choices)
+        )
+        self.auto_ie_range_var = tk.BooleanVar(value=False)
         self.output_dir_var = tk.StringVar(value=str(Path.cwd() / "auto_cv_data"))
         self.cv_widgets = []
         self._build_cv_controls()
@@ -57,7 +64,7 @@ class XYFullCVCycleWindow(XYPumpCycleWindow):
                     child.configure(text="Post-CV run (s)")
             except tk.TclError:
                 pass
-        self.start_button.grid_configure(row=23)
+        self.start_button.grid_configure(row=23, columnspan=1); self.restart_button.grid_configure(row=23)
         self.stop_button.grid_configure(row=23)
         specs = (
             ("Initial V", self.cv_initial_var), ("Apex 1 V", self.cv_apex1_var),
@@ -70,10 +77,22 @@ class XYFullCVCycleWindow(XYPumpCycleWindow):
             row = 16 + (index // 5) * 2
             column = index % 5
             ttk.Label(frame, text=label).grid(row=row, column=column, sticky="w", padx=5, pady=(7, 2))
-            entry = ttk.Entry(frame, textvariable=variable, width=9)
+            if label == "IE range":
+                entry = ttk.Combobox(
+                    frame, textvariable=variable, values=self.cv_ie_range_choices,
+                    state="readonly", width=14
+                )
+                self.cv_ie_range_entry = entry
+            else:
+                entry = ttk.Entry(frame, textvariable=variable, width=9)
             entry.grid(row=row + 1, column=column, sticky="w", padx=5)
             self.cv_widgets.append(entry)
-        ttk.Label(frame, text="CV output folder").grid(row=20, column=0, sticky="w", padx=5, pady=(8, 2))
+        auto_range = ttk.Checkbutton(
+            frame, text="Auto IE range (PF off)", variable=self.auto_ie_range_var
+        )
+        auto_range.grid(row=20, column=0, sticky="w", padx=5)
+        self.cv_widgets.append(auto_range)
+        ttk.Label(frame, text="CV output folder").grid(row=20, column=1, sticky="w", padx=5, pady=(8, 2))
         output_entry = ttk.Entry(frame, textvariable=self.output_dir_var, width=54)
         output_entry.grid(row=21, column=0, columnspan=4, sticky="ew", padx=5)
         browse = ttk.Button(frame, text="BROWSE", command=self._browse_output)
@@ -97,13 +116,16 @@ class XYFullCVCycleWindow(XYPumpCycleWindow):
                 "step_size": float(self.cv_step_var.get()),
                 "cycles": int(self.cv_cycles_var.get()),
                 "precharge": float(self.cv_precharge_var.get()),
-                "ie_range": float(self.cv_ie_range_var.get()),
+                "ie_range": ie_range_enum(self.cv_ie_range_var.get()),
+                "auto_ie_range": bool(self.auto_ie_range_var.get()),
             }
         except (tk.TclError, ValueError):
             raise ValueError("CV parameters must be numbers")
         if params["scan_rate"] <= 0 or params["step_size"] <= 0:
             raise ValueError("CV scan rate and step must be greater than zero")
-        if params["cycles"] < 1 or params["precharge"] < 0 or params["ie_range"] <= 0:
+        if params["cycles"] < 1 or params["precharge"] < 0 or (
+            not params["auto_ie_range"] and params["ie_range"] <= 0
+        ):
             raise ValueError("CV cycles/IE range must be positive and precharge non-negative")
         output_dir = Path(self.output_dir_var.get()).expanduser()
         if not str(output_dir).strip():
@@ -112,6 +134,8 @@ class XYFullCVCycleWindow(XYPumpCycleWindow):
         return params, output_dir
 
     def start(self):
+        if self.running:
+            return
         try:
             self.cv_params, self.output_dir = self._cv_parameters()
         except Exception as error:
@@ -120,10 +144,11 @@ class XYFullCVCycleWindow(XYPumpCycleWindow):
         XYPumpCycleWindow.start(self)
         if not self.running:
             return
-        self.data_manager = ExperimentDataManager(
-            self.output_dir, "CV", self.path_name, self.points,
-            self._manifest_settings(self.cv_params)
-        )
+        if self.data_manager is None:
+            self.data_manager = ExperimentDataManager(
+                self.output_dir, "CV", self.path_name, self.points,
+                self._manifest_settings(self.cv_params)
+            )
         if self.claim_measurement is not None:
             if not self.claim_measurement("AUTO_CV"):
                 XYPumpCycleWindow.stop(self)
@@ -142,14 +167,11 @@ class XYFullCVCycleWindow(XYPumpCycleWindow):
         self.press_state = "starting_pumps"
         point = self._current_target()
         self.status_var.set("STABILIZED — starting pumps at point {}".format(point["index"]))
-        for pump_id, rpm, unused_duration in self.pump_configs:
-            if not self.send_command("PUMP SPEED {} {:.2f}".format(pump_id, rpm)):
-                self._finish("FAILED — pump speed command was not sent")
-                return
-            if not self.send_command("PUMP START {}".format(pump_id)):
-                self._finish("FAILED — pump start command was not sent")
-                return
-            self.running_pumps.add(pump_id)
+        self._start_selected_pumps(self._all_pumps_started_before_cv)
+
+    def _all_pumps_started_before_cv(self):
+        if not self.running:
+            return
         self.pump_start_deadline = time.monotonic() + 5.0
         self.after_id = self.after(100, self._wait_for_pumps_before_cv)
 
@@ -226,11 +248,7 @@ class XYFullCVCycleWindow(XYPumpCycleWindow):
             return
         self.pump_stop_deadline = None
         self.status_var.set("PUMPS STOPPED — pre-lift wait complete — lifting")
-        self.press_state = "lifting"
-        if not self.send_command(
-            "LIFT {:.3f} {:.3f}".format(self.lift_distance, self.lift_speed)
-        ):
-            self._finish("FAILED — lift command was not sent after CV")
+        XYPumpCycleWindow._start_lift_after_wait(self)
 
     def _cv_error(self, error):
         self._finish("ABORTED — CV failed: {} — use manual LIFT".format(error))
@@ -260,3 +278,4 @@ class XYFullCVCycleWindow(XYPumpCycleWindow):
         if hasattr(self, "cv_widgets"):
             for widget in self.cv_widgets:
                 widget.configure(state="normal")
+            self.cv_ie_range_entry.configure(state="readonly")

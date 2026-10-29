@@ -5,6 +5,7 @@ import sys
 import tempfile
 import types
 import unittest
+from unittest.mock import patch
 
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
@@ -26,6 +27,7 @@ if "serial" not in sys.modules:
 sys.path.insert(0, str(ROOT))
 from x_control import (  # noqa: E402
     GantryMotionUI,
+    append_environment_record,
     extract_complete_lines,
     load_scan_start_offsets,
     parse_status_line,
@@ -34,11 +36,170 @@ from x_control import (  # noqa: E402
 from experiment_data import ExperimentDataManager  # noqa: E402
 from experiment_resume_preview import load_experiment_preview  # noqa: E402
 from xy_eis_comp_cv_cycle import XYEISCompCVCycleWindow  # noqa: E402
+from xy_full_eis_cycle import XYFullEISCycleWindow  # noqa: E402
+from xy_press_cycle import XYPressCycleWindow  # noqa: E402
+from xy_pump_cycle import XYPumpCycleWindow  # noqa: E402
 from circular_scan_path import generate_circular_path  # noqa: E402
 from rectangular_scan_path import generate_rectangular_path  # noqa: E402
+from gamry_lsv_manual import ManualLSVWindow  # noqa: E402
+from auto_lsv_measurement import AutoLSVMeasurement  # noqa: E402
+from auto_cv_measurement import AutoCVMeasurement  # noqa: E402
+from xy_eis_comp_lsv_cycle import XYEISCompLSVCycleWindow  # noqa: E402
 
 
 class MotionProtocolTests(unittest.TestCase):
+    def test_eis_cv_screenshot_defaults(self):
+        class Var:
+            def __init__(self):
+                self.value = None
+
+            def set(self, value):
+                self.value = value
+
+        names = (
+            "speed", "dwell", "press_force", "press_travel", "press_speed",
+            "lift_distance", "lift_speed", "pressed_stabilization", "pre_lift_wait",
+            "press_pump_enabled", "press_pump_duration",
+            "pump_start_interval", "suction_enabled", "suction_with_lift",
+            "suction_lift_delay", "frequencies", "repeats", "ac_amplitude",
+            "dc_bias", "gain", "zmod", "passes", "cycles_delay", "settle",
+            "max_phase", "z_bad", "min_bad", "max_eis_attempts", "cv_initial",
+            "cv_apex1", "cv_apex2", "cv_final", "cv_scan_rate", "cv_step",
+            "cv_cycles", "cv_precharge", "cv_ie_range", "pos_feed",
+            "auto_ie_range", "comp_fraction", "min_ru", "max_ru",
+        )
+        window = types.SimpleNamespace(**{name + "_var": Var() for name in names})
+        for group in ("press_pump_rpm", "pump_enabled", "pump_rpm", "pump_duration", "suction_rpm", "suction_duration"):
+            setattr(window, group + "_vars", [Var(), Var()])
+        window.cv_ie_range_choices = ["8 — 600uA", "9 — 6mA"]
+        XYEISCompCVCycleWindow._apply_default_setup(window)
+
+        self.assertEqual(window.press_force_var.value, 45.0)
+        self.assertEqual(window.lift_speed_var.value, 0.15)
+        self.assertTrue(window.press_pump_enabled_var.value)
+        self.assertEqual(window.press_pump_duration_var.value, 1.5)
+        self.assertEqual([var.value for var in window.press_pump_rpm_vars], [1.0, 0.0])
+        self.assertEqual([var.value for var in window.pump_rpm_vars], [2.2, 2.1])
+        self.assertEqual([var.value for var in window.pump_duration_vars], [2.0, 2.0])
+        self.assertEqual(window.pressed_stabilization_var.value, 10.0)
+        self.assertEqual(window.pump_start_interval_var.value, 0.0)
+        self.assertEqual([var.value for var in window.suction_duration_vars], [4.5, 6.0])
+        self.assertEqual(window.suction_lift_delay_var.value, 4.0)
+        self.assertEqual(window.frequencies_var.value, "1000000, 300000, 170000, 100000, 30000")
+        self.assertEqual(window.dc_bias_var.value, -1.1)
+        self.assertEqual(window.z_bad_var.value, 500.0)
+        self.assertEqual([var.value for var in (
+            window.cv_initial_var, window.cv_apex1_var,
+            window.cv_apex2_var, window.cv_final_var,
+        )], [-1.1, -1.5, -1.1, -1.1])
+        self.assertEqual(window.cv_cycles_var.value, 1)
+        self.assertEqual(window.cv_precharge_var.value, 0.0)
+        self.assertEqual(window.cv_ie_range_var.value, "9 — 6mA")
+        self.assertTrue(window.pos_feed_var.value)
+        self.assertFalse(window.auto_ie_range_var.value)
+        self.assertEqual(window.comp_fraction_var.value, 0.85)
+        self.assertEqual(window.max_ru_var.value, 500.0)
+        source = (ROOT / "xy_eis_comp_cv_cycle.py").read_text(encoding="utf-8")
+        self.assertIn("if type(self) is XYEISCompCVCycleWindow:", source)
+        self.assertLess(source.index("self._apply_default_setup()"),
+                        source.index("self._apply_resume_settings(resume_manager.data"))
+
+    def test_automatic_cv_ie_range_follows_pf_mode(self):
+        def run_case(auto_range, resistance):
+            calls = []
+            pstat = types.SimpleNamespace(
+                set_ctrl_mode=lambda mode: None,
+                set_ie_range_mode=lambda enabled: calls.append(("auto", enabled)),
+                set_ie_range=lambda selected: calls.append(("fixed", selected)),
+                set_pos_feed_resistance=lambda value: None,
+                set_pos_feed_enable=lambda enabled: None,
+                set_cell=lambda enabled: None,
+            )
+            tkp = types.SimpleNamespace(
+                PSTATMODE=1, pstat_is_valid=lambda unused: True,
+                RcvCurve=lambda unused, capacity: object(),
+            )
+            owner = types.SimpleNamespace(after=lambda ms, callback: "timer")
+            runner = AutoCVMeasurement(owner, pstat, tkp)
+            runner._create_signal = lambda params, sample_time: object()
+            runner._attach_signal = lambda signal: None
+            pstat.init_signal = lambda: None
+            params = {
+                "auto_ie_range": auto_range, "ie_range": 8,
+                "pos_feed_resistance": resistance, "scan_rate": 0.1,
+                "step_size": 0.001, "precharge": 0.0,
+            }
+            with tempfile.TemporaryDirectory() as folder:
+                with patch("auto_cv_measurement.initialize_pstat_for_cv"):
+                    if auto_range and resistance > 0:
+                        with self.assertRaises(ValueError):
+                            runner.start(params, pathlib.Path(folder) / "cv.csv", {}, (0, 0, 0), None, None)
+                    else:
+                        runner.start(params, pathlib.Path(folder) / "cv.csv", {}, (0, 0, 0), None, None)
+            return calls
+
+        self.assertEqual(run_case(True, 0.0), [("auto", True)])
+        self.assertEqual(run_case(False, 10.0), [("auto", False), ("fixed", 8)])
+        self.assertEqual(run_case(True, 10.0), [])
+
+    def test_combined_automatic_ie_range_requires_pf_off(self):
+        values = {
+            "cv_initial_var": -0.5, "cv_apex1_var": -1.2,
+            "cv_apex2_var": -0.5, "cv_final_var": -0.5,
+            "cv_scan_rate_var": 0.1, "cv_step_var": 0.001,
+            "cv_cycles_var": 1, "cv_precharge_var": 10.0,
+            "cv_ie_range_var": "8 — 600uA", "comp_fraction_var": 0.5,
+            "min_ru_var": 0.01, "max_ru_var": 10000.0,
+            "auto_ie_range_var": True, "pos_feed_var": False,
+        }
+        for window_class in (XYEISCompCVCycleWindow, XYEISCompLSVCycleWindow):
+            window = window_class.__new__(window_class)
+            for name, value in values.items():
+                setattr(window, name, types.SimpleNamespace(get=lambda selected=value: selected))
+            if window_class is XYEISCompLSVCycleWindow:
+                window.cv_final_var = types.SimpleNamespace(get=lambda: -1.2)
+                window.cv_scan_rate_var = types.SimpleNamespace(get=lambda: 0.01)
+            params, fraction, unused_min, unused_max = window._comp_cv_parameters()
+            self.assertTrue(params["auto_ie_range"])
+            self.assertEqual(fraction, 0.0)
+            window.pos_feed_var = types.SimpleNamespace(get=lambda: True)
+            with self.assertRaises(ValueError):
+                window._comp_cv_parameters()
+
+    def test_environment_csv_is_simple_and_append_only(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = pathlib.Path(directory) / "environment.csv"
+            first = {
+                "timestamp": "2026-09-28T10:00:00",
+                "elapsed_minutes": 0.0,
+                "temperature_c": 22.5,
+                "humidity_rh_percent": 48.0,
+                "measurement_mode": "CV",
+                "point_index": 1,
+                "x_mm": 1.0,
+                "y_mm": 2.0,
+                "z_mm": 3.0,
+            }
+            append_environment_record(path, first)
+            append_environment_record(path, dict(first, elapsed_minutes=15.0))
+            rows = path.read_text(encoding="utf-8-sig").splitlines()
+            self.assertEqual(len(rows), 3)
+            self.assertIn("temperature_c", rows[0])
+            self.assertIn("humidity_rh_percent", rows[0])
+            self.assertIn("2026-09-28T10:00:00", rows[1])
+
+    def test_environment_sensor_is_on_demand_and_automatic_only(self):
+        firmware = (
+            ROOT / "mega_x_controller" / "mega_x_controller.ino"
+        ).read_text(encoding="utf-8")
+        ui = (ROOT / "x_control.py").read_text(encoding="utf-8")
+        self.assertIn("const uint8_t DHT_PIN = 26", firmware)
+        self.assertIn('strcmp(verb, "ENV")', firmware)
+        self.assertIn("if (anyAxisMoving())", firmware)
+        self.assertIn('window.data_manager.root / "environment.csv"', ui)
+        self.assertIn("values=tuple(range(15, 1441, 15))", ui)
+        self.assertIn('self.send_command("ENV")', ui)
+
     def test_scan_start_offsets_persist_and_invalid_files_fall_back(self):
         with tempfile.TemporaryDirectory() as directory:
             settings_path = pathlib.Path(directory) / "settings.json"
@@ -107,14 +268,14 @@ class MotionProtocolTests(unittest.TestCase):
         self.assertEqual(lines, [])
         lines, buffer = extract_complete_lines(
             buffer,
-            b"GANTRY_M6\r\nSTATUS,X=0,Y=0,Z=0,SX=0,SY=0,SZ=0,"
+            b"GANTRY_M6_SAFE500\r\nSTATUS,X=0,Y=0,Z=0,SX=0,SY=0,SZ=0,"
             b"L=000000,M=000,H=000,A=00,P=00,PI=2,PO=2,"
             b"LC=1,T=0,R=0,FR=0,F=0,PR=0,PD=0\n",
         )
         self.assertEqual(
             lines,
             [
-                "IDENTITY,MEGA_GANTRY_M6",
+                "IDENTITY,MEGA_GANTRY_M6_SAFE500",
                 "STATUS,X=0,Y=0,Z=0,SX=0,SY=0,SZ=0,L=000000,M=000,H=000,A=00,P=00,PI=2,PO=2,LC=1,T=0,R=0,FR=0,F=0,PR=0,PD=0",
             ],
         )
@@ -184,14 +345,93 @@ class MotionProtocolTests(unittest.TestCase):
         ).read_text(encoding="utf-8")
         ui = (ROOT / "x_control.py").read_text(encoding="utf-8")
         self.assertIn("PUMP_IN_STEP = 30", firmware)
+        self.assertIn("PUMP_IN_DIR = 31", firmware)
         self.assertIn("PUMP_OUT_STEP = 32", firmware)
+        self.assertIn("PUMP_OUT_DIR = 33", firmware)
         self.assertIn("ISR(TIMER3_COMPA_vect)", firmware)
         self.assertIn("ISR(TIMER4_COMPA_vect)", firmware)
-        self.assertIn("digitalWrite(pumps[pumpId].dirPin, LOW)", firmware)
+        self.assertIn("digitalWrite(pumps[pumpId].dirPin, reverse ? LOW : HIGH)", firmware)
         self.assertIn("stopAllPumps();", firmware)
         self.assertIn('strcmp(verb, "MOTION_STOP")', firmware)
         self.assertIn('self.send_command("PUMP START {}".format(pump_id))', ui)
         self.assertIn('self.send_command("PUMP STOP {}".format(pump_id))', ui)
+
+    def test_automatic_cycles_start_pumps_only_after_press_force_stop(self):
+        source = (ROOT / "xy_pump_cycle.py").read_text(encoding="utf-8")
+        start_press = source[source.index("    def _start_press(self):"):
+                             source.index("    def _pump_time_complete(self")]
+        self.assertNotIn('self.send_command("PUMP START {}"', start_press)
+        force_event = source[source.index("    def handle_controller_line(self, line):"):
+                             source.index("    def _start_pumps(self):")]
+        self.assertIn('line.startswith("EVENT,PRESS_FORCE_STOP")', force_event)
+        self.assertIn("self._start_pumps()", force_event)
+
+    def test_pump_speed_defaults_match_latest_experiment_setup(self):
+        main = (ROOT / "x_control.py").read_text(encoding="utf-8")
+        automatic = (ROOT / "xy_pump_cycle.py").read_text(encoding="utf-8")
+        self.assertIn("DEFAULT_PUMP_RPM = 2.0", main)
+        self.assertIn(
+            "self.pump_rpm_vars = [tk.DoubleVar(value=1.2), tk.DoubleVar(value=1.0)]",
+            automatic,
+        )
+
+    def test_automatic_pump_start_interval_controls_order(self):
+        source = (ROOT / "xy_pump_cycle.py").read_text(encoding="utf-8")
+        self.assertIn("self.pump_start_interval_var = tk.DoubleVar(value=0.5)", source)
+        self.assertIn(
+            "self.pump_duration_vars = [tk.DoubleVar(value=1.0), tk.DoubleVar(value=2.0)]",
+            source,
+        )
+        self.assertIn("Pump start interval (s; +IN / -OUT)", source)
+        self.assertIn("if self.pump_start_interval < 0:", source)
+        self.assertIn("int(abs(self.pump_start_interval) * 1000)", source)
+        self.assertIn('"pump_start_interval_s": self.pump_start_interval', source)
+
+    def test_optional_suction_runs_after_pumps_and_before_lift(self):
+        cycle = XYFullEISCycleWindow.__new__(XYFullEISCycleWindow)
+        commands, timers = [], []
+        cycle.running = True
+        cycle.press_state = "post_eis_failure_pumping"
+        cycle.running_pumps = {0, 1}
+        cycle.pump_after_ids = {0: "normal-in", 1: "normal-out"}
+        cycle.suction_configs = [(0, -2.0, 1.0), (1, 2.0, 1.5)]
+        cycle.pre_lift_wait = 0.5
+        cycle.reported_pump_states = (False, False)
+        cycle.pump_stop_deadline = None
+        cycle.lift_distance, cycle.lift_speed = 3.0, 1.0
+        cycle.status_var = types.SimpleNamespace(set=lambda unused: None)
+        cycle.send_command = lambda command, require_ready=True: commands.append(command) or True
+        cycle.after = lambda ms, callback: timers.append((ms, callback)) or len(timers)
+
+        cycle._pump_time_complete(0)
+        self.assertEqual(commands, ["PUMP STOP 0"])
+        cycle._pump_time_complete(1)
+        self.assertEqual(commands[1:], ["PUMP STOP 1", "PUMP RUN 0 -2.00", "PUMP RUN 1 2.00"])
+        self.assertEqual([ms for ms, unused in timers], [1000, 1500])
+        self.assertEqual(cycle.press_state, "suction")
+        timers[0][1]()
+        self.assertEqual(commands[-1], "PUMP STOP 0")
+        timers[1][1]()
+        self.assertEqual(commands[-1], "PUMP STOP 1")
+        self.assertEqual(timers[2][0], 500)
+        timers[2][1]()
+        self.assertEqual(commands[-1], "LIFT 3.000 1.000")
+
+    def test_suction_rejects_old_firmware_and_saves_resume_settings(self):
+        cycle = XYPumpCycleWindow.__new__(XYPumpCycleWindow)
+        failures = []
+        cycle.running = True
+        cycle.press_state = "suction"
+        cycle._finish = failures.append
+        XYPumpCycleWindow.handle_controller_line(cycle, "ERROR,BAD_PUMP_ACTION")
+        self.assertIn("suction command rejected", failures[0])
+        firmware = (ROOT / "mega_x_controller" / "mega_x_controller.ino").read_text(encoding="utf-8")
+        self.assertIn('strcmp(action, "RUN")', firmware)
+        self.assertIn("startPump(pumpId, signedRpm < 0.0f)", firmware)
+        source = (ROOT / "xy_pump_cycle.py").read_text(encoding="utf-8")
+        resume = (ROOT / "xy_eis_comp_cv_cycle.py").read_text(encoding="utf-8")
+        self.assertIn('"suction": {', source)
+        self.assertIn('settings.get("suction", {})', resume)
 
     def test_milestone_five_reads_s_type_load_cell_without_press_down(self):
         firmware = (
@@ -224,6 +464,60 @@ class MotionProtocolTests(unittest.TestCase):
         self.assertIn('self.send_command("MOTION_STOP")', ui)
         self.assertIn('self.send_command("LIFT")', ui)
 
+    def test_press_stops_on_missing_or_frozen_load_cell_data(self):
+        firmware = (
+            ROOT / "mega_x_controller" / "mega_x_controller.ino"
+        ).read_text(encoding="utf-8")
+        self.assertIn("pinMode(ADS1220_DRDY, INPUT_PULLUP)", firmware)
+        self.assertIn("LOAD_CELL_SAMPLE_TIMEOUT_MS = 500", firmware)
+        self.assertIn("LOAD_CELL_CHANGE_TIMEOUT_MS = 750", firmware)
+        self.assertIn("millis() - lastLoadCellSampleMillis", firmware)
+        self.assertIn("millis() - lastLoadCellChangeMillis", firmware)
+        self.assertIn("if (loadCellFault() != NULL || !loadCellTared", firmware)
+        self.assertIn('EVENT,PRESS_SENSOR_FAULT_STOP,', firmware)
+        self.assertIn('ERROR,TARE_DURING_Z_MOTION', firmware)
+
+        cycle = XYPressCycleWindow.__new__(XYPressCycleWindow)
+        cycle.running = True
+        cycle.press_state = "pressing"
+        messages = []
+        cycle._finish = messages.append
+        cycle.handle_controller_line("EVENT,PRESS_SENSOR_FAULT_STOP,FROZEN")
+        self.assertEqual(len(messages), 1)
+        self.assertIn("re-tare", messages[0])
+
+    def test_z_force_hard_limit_covers_all_motion_modes(self):
+        firmware = (
+            ROOT / "mega_x_controller" / "mega_x_controller.ino"
+        ).read_text(encoding="utf-8")
+        ui = (ROOT / "x_control.py").read_text(encoding="utf-8")
+        self.assertIn("Z_FORCE_LIMIT_G = 500.0f", firmware)
+        self.assertIn("MAX_PRESS_FORCE_G = 500.0f", firmware)
+        self.assertIn("if (axis.name == 'Z' && direction < 0 && !zDownwardSafetyReady())", firmware)
+        self.assertIn("LOAD_CELL_CAL_SLOPE * (loadCellRaw - loadCellTareRaw)", firmware)
+        self.assertIn("zSafetyForceGrams() >= Z_FORCE_LIMIT_G && !zForceOverloadLatched", firmware)
+        self.assertIn('EVENT,Z_FORCE_LIMIT_STOP,', firmware)
+        self.assertIn('Serial.print(F(",PL="))', firmware)
+        self.assertIn('self.press_lift_available = values.get("PL") == "1"', ui)
+        self.assertIn('text="SUCK + LIFT"', ui)
+
+    def test_homepage_suck_lift_requires_controller_press_record(self):
+        ui = GantryMotionUI.__new__(GantryMotionUI)
+        ui.controller_ready = True
+        ui.press_lift_available = False
+        ui.gamry_measurement_owner = None
+        ui.moving_vars = {"Z": types.SimpleNamespace(get=lambda: "IDLE")}
+        ui.pump_status_vars = [types.SimpleNamespace(get=lambda: "STOPPED") for _ in range(2)]
+        for name in (
+            "xy_dry_run_window", "xy_press_cycle_window", "xy_pump_cycle_window",
+            "xy_full_cv_window", "xy_full_eis_window", "xy_eis_cv_window",
+            "xy_eis_lsv_window", "xy_full_ca_window",
+        ):
+            setattr(ui, name, None)
+        self.assertFalse(ui.manual_suck_lift_guard()[0])
+        ui.press_lift_available = True
+        self.assertEqual(ui.manual_suck_lift_guard(), (True, ""))
+
     def test_milestone_seven_only_detects_and_connects_gamry(self):
         ui = (ROOT / "x_control.py").read_text(encoding="utf-8")
         self.assertIn("import toolkitpy as tkp", ui)
@@ -243,10 +537,10 @@ class MotionProtocolTests(unittest.TestCase):
         self.assertIn("initialize_pstat_for_cv", cv)
         self.assertIn("signal_r_up_dn_new", cv)
         self.assertIn("RcvCurve", cv)
-        self.assertIn("self.signal = self.pstat.signal_r_up_dn_new", cv)
-        self.assertIn("CV ended without data", cv)
+        self.assertIn("return self.pstat.signal_r_up_dn_new", cv)
+        self.assertIn("ended without data", cv)
         self.assertIn("self.auto_ie_range_var = tk.BooleanVar(value=False)", cv)
-        self.assertIn("self.ie_range_var = tk.DoubleVar(value=10.0)", cv)
+        self.assertIn("self.ie_range_choices = ie_range_choices(self.pstat)", cv)
         self.assertIn("self.pstat.set_ie_range_mode(True)", cv)
         self.assertIn("self.pstat.set_ie_range_mode(False)", cv)
         self.assertIn('self.pstat.set_ie_range(params["ie_range"])', cv)
@@ -254,12 +548,57 @@ class MotionProtocolTests(unittest.TestCase):
         self.assertIn("set_cell(True)", cv)
         self.assertIn("set_cell(False)", cv)
         self.assertIn("curve.stop()", cv)
-        self.assertGreaterEqual(cv.count("tk.DoubleVar(value=0.0)"), 4)
+        self.assertIn("self.initial_var = tk.DoubleVar(value=-0.5)", cv)
+        self.assertIn("self.apex1_var = tk.DoubleVar(value=-1.5)", cv)
+        self.assertIn("self.apex2_var = tk.DoubleVar(value=-0.5)", cv)
+        self.assertIn("self.final_var = tk.DoubleVar(value=-0.5)", cv)
         self.assertIn('value=0.10', cv)
         self.assertIn('value=0.001', cv)
         self.assertIn('value=4', cv)
         self.assertNotIn("GamryCA", cv)
         self.assertNotIn("GamryEIS", cv)
+
+    def test_manual_and_automatic_lsv_use_single_ramp_signal(self):
+        ui = (ROOT / "x_control.py").read_text(encoding="utf-8")
+        manual = (ROOT / "gamry_lsv_manual.py").read_text(encoding="utf-8")
+        automatic = (ROOT / "auto_lsv_measurement.py").read_text(encoding="utf-8")
+        cycle = (ROOT / "xy_eis_comp_lsv_cycle.py").read_text(encoding="utf-8")
+        self.assertIn("ManualLSVWindow", ui)
+        self.assertIn("signal_ramp_new", manual)
+        self.assertIn("set_signal_ramp", manual)
+        self.assertNotIn("signal_r_up_dn_new", manual)
+        self.assertIn("signal_ramp_new", automatic)
+        self.assertIn("set_signal_ramp", automatic)
+        self.assertIn('return "EIS_GetRu_compensated_LSV"', cycle)
+        self.assertIn('"pos_feed_resistance": resistance', cycle)
+        self.assertIn("self._restore_measurement_pumps()", cycle)
+        self.assertIn("EIS + COMP LSV", (ROOT / "circular_scan_path.py").read_text(encoding="utf-8"))
+        self.assertIn("EIS + COMP LSV", (ROOT / "rectangular_scan_path.py").read_text(encoding="utf-8"))
+
+        calls = []
+        pstat = types.SimpleNamespace(
+            signal_ramp_new=lambda *args: calls.append(("new", args)) or "signal",
+            set_signal_ramp=lambda signal: calls.append(("set", signal)),
+        )
+        tkp = types.SimpleNamespace(PSTATMODE=7)
+        manual_window = ManualLSVWindow.__new__(ManualLSVWindow)
+        manual_window.pstat, manual_window.tkp = pstat, tkp
+        signal = manual_window._create_signal(
+            {"initial": -0.2, "final": 0.8, "scan_rate": 0.01}, 0.1
+        )
+        manual_window._attach_signal(signal)
+        self.assertEqual(calls[0], ("new", (-0.2, 0.8, 0.01, 0.1, 7)))
+        self.assertEqual(calls[1], ("set", "signal"))
+
+        calls[:] = []
+        automatic_runner = AutoLSVMeasurement.__new__(AutoLSVMeasurement)
+        automatic_runner.pstat, automatic_runner.tkp = pstat, tkp
+        signal = automatic_runner._create_signal(
+            {"initial": 0.0, "final": 1.0, "scan_rate": 0.02}, 0.1
+        )
+        automatic_runner._attach_signal(signal)
+        self.assertEqual(calls[0], ("new", (0.0, 1.0, 0.02, 0.1, 7)))
+        self.assertEqual(calls[1], ("set", "signal"))
 
     def test_manual_ca_matches_verified_mg400_parameters(self):
         ui = (ROOT / "x_control.py").read_text(encoding="utf-8")
@@ -286,7 +625,7 @@ class MotionProtocolTests(unittest.TestCase):
         self.assertIn("ManualEISWindow", ui)
         self.assertIn("GamryEIS", eis_ui)
         self.assertIn("DEFAULT_FREQUENCIES", eis_ui)
-        self.assertIn("self.dc_bias_var = tk.DoubleVar(value=0.0)", eis_ui)
+        self.assertIn("self.dc_bias_var = tk.DoubleVar(value=-1.0)", eis_ui)
         self.assertIn("self.ac_amplitude_var = tk.DoubleVar(value=0.007)", eis_ui)
         self.assertIn("self.zmod_var = tk.DoubleVar(value=40.0)", eis_ui)
         self.assertIn("self.max_phase_var = tk.DoubleVar(value=7.5)", eis_ui)
@@ -392,11 +731,13 @@ class MotionProtocolTests(unittest.TestCase):
         source = (ROOT / "xy_press_cycle.py").read_text(encoding="utf-8")
         self.assertIn('"PRESS {:.2f} {:.3f} {:.3f}"', source)
         self.assertIn('line.startswith("EVENT,PRESS_FORCE_STOP")', source)
-        self.assertIn("self.lift_speed_var = tk.DoubleVar(value=2.0)", source)
+        self.assertIn("self.lift_distance_var = tk.DoubleVar(value=3.0)", source)
+        self.assertIn("self.lift_speed_var = tk.DoubleVar(value=0.25)", source)
         self.assertIn('"LIFT {:.3f} {:.3f}".format(', source)
         self.assertIn('line == "EVENT,LIFT_DONE"', source)
         self.assertIn("maximum press travel reached", source)
-        self.assertNotIn('"PUMP ', source)
+        self.assertIn("self.press_pump_enabled_var = tk.BooleanVar(value=False)", source)
+        self.assertIn('"PUMP RUN {} {:.2f}"', source)
         self.assertNotIn("gamry_pstat", source)
         firmware = (
             ROOT / "mega_x_controller" / "mega_x_controller.ino"
@@ -411,10 +752,10 @@ class MotionProtocolTests(unittest.TestCase):
     def test_xy_pump_cycle_stops_pump_before_lift_and_has_no_gamry(self):
         source = (ROOT / "xy_pump_cycle.py").read_text(encoding="utf-8")
         self.assertIn("self.pump_enabled_vars", source)
-        self.assertEqual(source.count("tk.BooleanVar(value=True)"), 2)
+        self.assertIn("self.pump_enabled_vars = [\n            tk.BooleanVar(value=True),\n            tk.BooleanVar(value=True),\n        ]", source)
         self.assertIn("self.pump_rpm_vars", source)
         self.assertIn("self.pump_duration_vars", source)
-        self.assertIn("self.pressed_stabilization_var = tk.DoubleVar(value=1.0)", source)
+        self.assertIn("self.pressed_stabilization_var = tk.DoubleVar(value=10.0)", source)
         self.assertIn("self.pre_lift_wait_var = tk.DoubleVar(value=1.0)", source)
         self.assertIn('self.press_state = "stabilizing_with_pumps"', source)
         self.assertIn("self._start_pumps", source)
@@ -430,17 +771,19 @@ class MotionProtocolTests(unittest.TestCase):
 
     def test_full_cv_cycle_measures_before_lift_and_saves_per_point(self):
         source = (ROOT / "xy_full_cv_cycle.py").read_text(encoding="utf-8")
+        pumps = (ROOT / "xy_pump_cycle.py").read_text(encoding="utf-8")
         runner = (ROOT / "auto_cv_measurement.py").read_text(encoding="utf-8")
         self.assertIn("AutoCVMeasurement", source)
         self.assertIn("CV_point_{:04d}", source)
-        self.assertLess(source.index('"PUMP START {}"'), source.index("self.cv_runner.start("))
-        self.assertLess(source.index("self.cv_runner.start("), source.index('self.press_state = "lifting"'))
+        self.assertIn('"PUMP START {}"', pumps)
+        self.assertIn("self._start_selected_pumps", source)
+        self.assertLess(source.index("self.cv_runner.start("), source.index("XYPumpCycleWindow._start_lift_after_wait(self)"))
         cv_complete = source[source.index("    def _cv_complete"):source.index("    def _start_lift_after_wait")]
         self.assertIn("self.pump_after_ids[pump_id] = self.after(", cv_complete)
         self.assertIn("self._pump_time_complete(selected_id)", cv_complete)
         lift_wait = source[source.index("    def _start_lift_after_wait"):source.index("    def _cv_error")]
         self.assertIn("self.reported_pump_states != (False, False)", lift_wait)
-        self.assertIn('"LIFT {:.3f} {:.3f}"', lift_wait)
+        self.assertIn("XYPumpCycleWindow._start_lift_after_wait(self)", lift_wait)
         self.assertIn("initialize_pstat_for_cv", runner)
         self.assertIn("self.pstat.set_cell(True)", runner)
         self.assertIn("self.pstat.set_cell(False)", runner)
@@ -473,14 +816,125 @@ class MotionProtocolTests(unittest.TestCase):
 
     def test_full_eis_cycle_keeps_pumps_on_until_getru_finishes(self):
         source = (ROOT / "xy_full_eis_cycle.py").read_text(encoding="utf-8")
+        pumps = (ROOT / "xy_pump_cycle.py").read_text(encoding="utf-8")
         runner = (ROOT / "auto_eis_measurement.py").read_text(encoding="utf-8")
         self.assertIn("GamryEIS", runner)
         self.assertIn("result[\"avg_ru\"]", source)
         self.assertIn("EIS_point_{:04d}", source)
-        self.assertLess(source.index('"PUMP START {}"'), source.index("self.eis_runner.start("))
+        self.assertIn('"PUMP START {}"', pumps)
+        self.assertIn("self._start_selected_pumps", source)
         complete = source[source.index("    def _eis_complete"):source.index("    def _start_lift_after_wait")]
         self.assertIn("self._pump_time_complete(selected_id)", complete)
         self.assertIn("self.reported_pump_states != (False, False)", source)
+
+    def test_eis_failure_retries_then_skips_and_stops_after_three_points(self):
+        cycle = XYFullEISCycleWindow.__new__(XYFullEISCycleWindow)
+        events = []
+        failed_attempts = []
+        cycle.running = True
+        cycle.points = [{"index": index} for index in (1, 2, 3, 4)]
+        cycle.point_offset = 0
+        cycle.max_eis_attempts = 2
+        cycle.eis_attempt_count = 0
+        cycle.consecutive_failed_points = 0
+        cycle.eis_failure_pending = None
+        cycle.data_manager = types.SimpleNamespace(fail_active=failed_attempts.append)
+        cycle.status_var = types.SimpleNamespace(set=lambda unused: None)
+        cycle.completed_var = types.SimpleNamespace(set=lambda unused: None)
+        cycle.after = lambda unused_ms, callback: events.append(callback.__name__) or "timer"
+        cycle._finish = lambda message: events.append(message)
+        cycle._arrived = lambda: events.append("arrived")
+        cycle._move_x = lambda: events.append("move_x")
+
+        for point_index in (0, 1, 2):
+            cycle.eis_attempt_count = 1
+            cycle.eis_failure_pending = "bad contact"
+            XYFullEISCycleWindow._complete_pressed_point(cycle)
+            self.assertEqual(cycle.point_offset, point_index)
+            self.assertEqual(events[-1], "<lambda>")
+            cycle.eis_attempt_count = 2
+            cycle.eis_failure_pending = "bad contact"
+            XYFullEISCycleWindow._complete_pressed_point(cycle)
+            self.assertEqual(cycle.point_offset, point_index + 1)
+        self.assertEqual(len(failed_attempts), 6)
+        self.assertIn("three consecutive points", events[-1])
+
+    def test_eis_error_runs_pumps_then_waits_before_lift(self):
+        cycle = XYFullEISCycleWindow.__new__(XYFullEISCycleWindow)
+        events = []
+        timers = []
+        cycle.running = True
+        cycle.eis_failure_pending = None
+        cycle.eis_attempt_count = 0
+        cycle.max_eis_attempts = 3
+        cycle.pump_configs = [(0, 4.0, 4.0), (1, 3.7, 2.0)]
+        cycle.pump_after_ids = {}
+        cycle.running_pumps = {0, 1}
+        cycle.pre_lift_wait = 1.0
+        cycle.status_var = types.SimpleNamespace(set=lambda unused: None)
+        cycle._stop_pump = lambda pump_id: (events.append("stop {}".format(pump_id)), cycle.running_pumps.discard(pump_id))
+        cycle._start_lift_after_wait = lambda: events.append("lift check")
+        cycle.after = lambda ms, callback: timers.append((ms, callback)) or len(timers)
+        XYFullEISCycleWindow._eis_error(cycle, "bad contact")
+        self.assertEqual(events, [])
+        self.assertEqual([ms for ms, unused in timers], [4000, 2000])
+        timers[1][1]()
+        self.assertEqual(events, ["stop 1"])
+        timers[0][1]()
+        self.assertEqual(events, ["stop 1", "stop 0"])
+        self.assertEqual(timers[2][0], 1000)
+        timers[2][1]()
+        self.assertEqual(events[-1], "lift check")
+        self.assertEqual(cycle.eis_attempt_count, 1)
+
+    def test_resume_eis_failure_uses_saved_post_eis_times(self):
+        cycle = XYEISCompCVCycleWindow.__new__(XYEISCompCVCycleWindow)
+        timers = []
+        stopped = []
+        cycle.running = True
+        cycle.resume_manager = object()
+        cycle.eis_failure_pending = None
+        cycle.eis_attempt_count = 0
+        cycle.max_eis_attempts = 3
+        cycle.pump_configs = [(0, 4.0, 1.8), (1, 3.7, 2.0)]
+        cycle.pump_after_ids = {}
+        cycle.running_pumps = {0, 1}
+        cycle.pre_lift_wait = 1.0
+        cycle.status_var = types.SimpleNamespace(set=lambda unused: None)
+        cycle._stop_pump = lambda pump_id: (stopped.append(pump_id), cycle.running_pumps.discard(pump_id))
+        cycle.after = lambda ms, callback: timers.append((ms, callback)) or len(timers)
+
+        cycle._eis_error("bad contact")
+        self.assertEqual([ms for ms, unused in timers], [1800, 2000])
+        self.assertEqual(stopped, [])
+        timers[0][1]()
+        self.assertEqual(stopped, [0])
+        timers[1][1]()
+        self.assertEqual(stopped, [0, 1])
+        self.assertEqual(timers[2][0], 1000)
+        source = (ROOT / "xy_eis_comp_cv_cycle.py").read_text(encoding="utf-8")
+        self.assertIn('enabled[pump_id]["post_measurement_s"]', source)
+
+    def test_successful_point_resets_eis_failure_streak(self):
+        cycle = XYFullEISCycleWindow.__new__(XYFullEISCycleWindow)
+        completed = []
+        cycle.running = True
+        cycle.points = [{"index": 1}, {"index": 2}]
+        cycle.point_offset = 0
+        cycle.eis_failure_pending = None
+        cycle.eis_attempt_count = 2
+        cycle.consecutive_failed_points = 2
+        cycle.data_manager = types.SimpleNamespace(
+            active_index=1, complete_point=completed.append
+        )
+        cycle.completed_var = types.SimpleNamespace(set=lambda unused: None)
+        cycle.status_var = types.SimpleNamespace(set=lambda unused: None)
+        cycle.after = lambda unused_ms, unused_callback: "timer"
+        XYFullEISCycleWindow._complete_pressed_point(cycle)
+        self.assertEqual(completed, [1])
+        self.assertEqual(cycle.point_offset, 1)
+        self.assertEqual(cycle.eis_attempt_count, 0)
+        self.assertEqual(cycle.consecutive_failed_points, 0)
 
     def test_getru_compensated_cv_uses_measured_ru_and_positive_feedback(self):
         source = (ROOT / "xy_eis_comp_cv_cycle.py").read_text(encoding="utf-8")
@@ -492,6 +946,87 @@ class MotionProtocolTests(unittest.TestCase):
         self.assertIn("resistance > 0.0", runner)
         self.assertIn('self.pstat.set_pos_feed_enable(False)', runner)
 
+    def test_compensated_cv_defaults_match_latest_experiment_screenshot(self):
+        source = (ROOT / "xy_eis_comp_cv_cycle.py").read_text(encoding="utf-8")
+        for expected in (
+            "self.pressed_stabilization_var.set(10.0)",
+            "self.ac_amplitude_var.set(0.040)",
+            "self.dc_bias_var.set(-1.0)",
+            "self.zmod_var.set(1000.0)",
+            "self.cv_initial_var = tk.DoubleVar(value=-0.9)",
+            "self.cv_apex1_var = tk.DoubleVar(value=-1.6)",
+            "self.cv_apex2_var = tk.DoubleVar(value=-0.9)",
+            "self.cv_final_var = tk.DoubleVar(value=-0.9)",
+            "self.cv_cycles_var = tk.IntVar(value=3)",
+            "self.comp_fraction_var = tk.DoubleVar(value=0.0)",
+            "self.pos_feed_var = tk.BooleanVar(value=False)",
+        ):
+            self.assertIn(expected, source)
+
+    def test_compensated_cv_uses_hardware_ie_range_list(self):
+        source = (ROOT / "xy_eis_comp_cv_cycle.py").read_text(encoding="utf-8")
+        lsv = (ROOT / "xy_eis_comp_lsv_cycle.py").read_text(encoding="utf-8")
+        helper = (ROOT / "gamry_ie_range.py").read_text(encoding="utf-8")
+        self.assertIn("pstat.ie_range_lower_limit()", helper)
+        self.assertIn("pstat.ie_range_upper_limit()", helper)
+        self.assertIn("pstat.ie_range_label(range_id)", helper)
+        self.assertIn('state="readonly"', source)
+        self.assertIn('"ie_range": ie_range_enum(self.cv_ie_range_var.get())', source)
+        self.assertIn('"ie_range": ie_range_enum(self.cv_ie_range_var.get())', lsv)
+
+    def test_every_ie_range_control_is_a_hardware_dropdown(self):
+        files = (
+            "gamry_cv_manual.py", "gamry_ca_manual.py", "gamry_lsv_manual.py",
+            "xy_full_cv_cycle.py", "xy_full_ca_cycle.py",
+            "xy_eis_comp_cv_cycle.py", "xy_eis_comp_lsv_cycle.py",
+        )
+        for filename in files:
+            source = (ROOT / filename).read_text(encoding="utf-8")
+            self.assertIn("ie_range_enum(", source, filename)
+        for filename in files[:-2] + ("xy_eis_comp_cv_cycle.py",):
+            source = (ROOT / filename).read_text(encoding="utf-8")
+            self.assertIn("ttk.Combobox", source, filename)
+            self.assertIn('state="readonly"', source, filename)
+
+    def test_press_force_defaults_match_manual_and_automatic_setup(self):
+        main = (ROOT / "x_control.py").read_text(encoding="utf-8")
+        automatic = (ROOT / "xy_press_cycle.py").read_text(encoding="utf-8")
+        self.assertIn("self.press_force_var = tk.DoubleVar(value=60.0)", main)
+        self.assertIn("self.press_force_var = tk.DoubleVar(value=40.0)", automatic)
+
+    def test_automatic_measurement_defaults_match_experiment_screenshot(self):
+        eis = (ROOT / "xy_full_eis_cycle.py").read_text(encoding="utf-8")
+        cv = (ROOT / "xy_full_cv_cycle.py").read_text(encoding="utf-8")
+        combined = (ROOT / "xy_eis_comp_cv_cycle.py").read_text(encoding="utf-8")
+        ca = (ROOT / "xy_full_ca_cycle.py").read_text(encoding="utf-8")
+        for expected in (
+            "self.ac_amplitude_var = tk.DoubleVar(value=0.040)",
+            "self.dc_bias_var = tk.DoubleVar(value=-1.0)",
+            "self.zmod_var = tk.DoubleVar(value=1000.0)",
+        ):
+            self.assertIn(expected, eis)
+        for expected in (
+            "self.cv_initial_var = tk.DoubleVar(value=-0.9)",
+            "self.cv_apex1_var = tk.DoubleVar(value=-1.6)",
+            "self.cv_cycles_var = tk.IntVar(value=3)",
+            "value=ie_range_display(8, self.cv_ie_range_choices)",
+        ):
+            self.assertIn(expected, cv)
+        self.assertIn("ie_range_display(8, self.cv_ie_range_choices)", combined)
+        self.assertIn("ie_range_display(8, self.ie_range_choices)", ca)
+
+    def test_press_shows_forty_gram_offset_hint_without_firmware_compensation(self):
+        firmware = (ROOT / "mega_x_controller" / "mega_x_controller.ino").read_text(
+            encoding="utf-8"
+        )
+        ui = (ROOT / "x_control.py").read_text(encoding="utf-8")
+        automatic = (ROOT / "xy_press_cycle.py").read_text(encoding="utf-8")
+        self.assertNotIn("PRESS_FORCE_OVERSHOOT_OFFSET_G", firmware)
+        self.assertIn("Press force (actual ≈ set + 40 g):", ui)
+        self.assertIn("actual ≈ set + 40", automatic)
+        self.assertIn('self.press_status_var.set("PRESSING")', ui)
+        self.assertNotIn('"PRESSING — {:.3f} mm"', ui)
+
     def test_automatic_cv_and_eis_have_live_plots(self):
         plot = (ROOT / "automatic_live_plot.py").read_text(encoding="utf-8")
         cv = (ROOT / "xy_full_cv_cycle.py").read_text(encoding="utf-8")
@@ -501,14 +1036,27 @@ class MotionProtocolTests(unittest.TestCase):
         self.assertIn("self.live_plot.update_cv", cv)
         self.assertIn("self.live_plot.update_eis_csv", eis)
 
+    def test_manual_and_automatic_cv_use_robust_autoscaling(self):
+        helper = (ROOT / "cv_plot_scale.py").read_text(encoding="utf-8")
+        manual = (ROOT / "gamry_cv_manual.py").read_text(encoding="utf-8")
+        automatic = (ROOT / "automatic_live_plot.py").read_text(encoding="utf-8")
+        self.assertIn("startup_count", helper)
+        self.assertIn("np.percentile(scale_values, (1.0, 99.0))", helper)
+        self.assertIn("autoscale_cv_axes(self.axes, voltage, current)", manual)
+        self.assertIn(
+            "autoscale_cv_axes(self.cv_axes, voltage_values, current_values)", automatic
+        )
+
     def test_automatic_ca_has_live_plot_and_measurement_interlocks(self):
         plot = (ROOT / "automatic_live_plot.py").read_text(encoding="utf-8")
         source = (ROOT / "xy_full_ca_cycle.py").read_text(encoding="utf-8")
+        pumps = (ROOT / "xy_pump_cycle.py").read_text(encoding="utf-8")
         runner = (ROOT / "auto_ca_measurement.py").read_text(encoding="utf-8")
         self.assertIn("def update_ca", plot)
         self.assertIn("self.live_plot.update_ca", source)
         self.assertIn("signal_d_step_new", runner)
-        self.assertLess(source.index('"PUMP START {}"'), source.index("self.ca_runner.start("))
+        self.assertIn('"PUMP START {}"', pumps)
+        self.assertIn("self._start_selected_pumps", source)
         self.assertIn("self._pump_time_complete(selected_id)", source)
 
     def test_experiment_manifest_tracks_point_attempt_without_overwrite(self):
@@ -673,6 +1221,7 @@ class MotionProtocolTests(unittest.TestCase):
         cycle.press_force = 30.0
         cycle.reported_pump_states = None
         cycle.awaiting_axis = None
+        cycle.xy_move_axis = None
         cycle.xy_var = types.SimpleNamespace(set=lambda unused: None)
         cycle.status_var = types.SimpleNamespace(set=lambda unused: None)
         cycle.after_cancel = lambda unused: None

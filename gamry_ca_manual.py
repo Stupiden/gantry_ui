@@ -12,6 +12,9 @@ from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 from matplotlib.figure import Figure
 
 from gamry_cv_manual import initialize_pstat_for_cv
+from gamry_ie_range import choices as ie_range_choices
+from gamry_ie_range import display_value as ie_range_display
+from gamry_ie_range import enum_value as ie_range_enum
 
 
 class ManualCAWindow(tk.Toplevel):
@@ -48,7 +51,10 @@ class ManualCAWindow(tk.Toplevel):
         self.tstep2_var = tk.DoubleVar(value=0.150)
         self.sample_period_var = tk.DoubleVar(value=0.005)
         self.auto_ie_range_var = tk.BooleanVar(value=True)
-        self.ie_range_var = tk.DoubleVar(value=10.0)
+        self.ie_range_choices = ie_range_choices(self.pstat)
+        self.ie_range_var = tk.StringVar(
+            value=ie_range_display(10, self.ie_range_choices)
+        )
         self.csv_var = tk.StringVar(value=self._default_csv_path())
         self.status_var = tk.StringVar(value="READY")
 
@@ -90,8 +96,9 @@ class ManualCAWindow(tk.Toplevel):
         )
         self.auto_ie_range_check.grid(row=2, column=0, columnspan=2, sticky="w")
         ttk.Label(controls, text="Fixed IE range").grid(row=2, column=2, sticky="e")
-        self.ie_range_entry = ttk.Entry(
-            controls, textvariable=self.ie_range_var, width=10
+        self.ie_range_entry = ttk.Combobox(
+            controls, textvariable=self.ie_range_var,
+            values=self.ie_range_choices, state="readonly", width=14
         )
         self.ie_range_entry.grid(row=2, column=3, sticky="w", padx=(4, 10))
 
@@ -142,7 +149,7 @@ class ManualCAWindow(tk.Toplevel):
             "vstep2": float(self.vstep2_var.get()),
             "tstep2": float(self.tstep2_var.get()),
             "sample_period": float(self.sample_period_var.get()),
-            "ie_range": float(self.ie_range_var.get()),
+            "ie_range": ie_range_enum(self.ie_range_var.get()),
         }
         if values["tinit"] < 0:
             raise ValueError("Initial time cannot be negative")

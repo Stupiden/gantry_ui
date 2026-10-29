@@ -9,18 +9,42 @@ import numpy as np
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 from matplotlib.figure import Figure
 
+from cv_plot_scale import autoscale_cv_axes
+
 
 class AutomaticLivePlot(tk.Toplevel):
-    def __init__(self, parent, show_cv=False, show_eis=False, show_ca=False):
+    def __init__(
+        self, parent, show_cv=False, show_eis=False, show_ca=False,
+        voltammetry_label="CV"
+    ):
         tk.Toplevel.__init__(self, parent)
-        self.title("Automatic measurement — live plots")
+        if show_eis and not (show_cv or show_ca):
+            self.title("Automatic EIS / GetRu — live plot")
+        elif show_cv and not (show_eis or show_ca):
+            self.title("Automatic {} — live plot".format(voltammetry_label))
+        elif show_ca and not (show_cv or show_eis):
+            self.title("Automatic CA — live plot")
+        else:
+            self.title("Automatic measurement — live plots")
         self.geometry("940x680")
         self.protocol("WM_DELETE_WINDOW", self.withdraw)
-        notebook = ttk.Notebook(self)
-        notebook.pack(fill="both", expand=True)
+        multiple_plots = sum((show_cv, show_eis, show_ca)) > 1
+        if multiple_plots:
+            container = ttk.Notebook(self)
+            container.pack(fill="both", expand=True)
+        else:
+            container = self
+
+        def plot_frame(label):
+            frame = ttk.Frame(container)
+            if multiple_plots:
+                container.add(frame, text=label)
+            else:
+                frame.pack(fill="both", expand=True)
+            return frame
+
         if show_cv:
-            frame = ttk.Frame(notebook)
-            notebook.add(frame, text="CV")
+            frame = plot_frame(voltammetry_label)
             figure = Figure(figsize=(7.5, 5.5), dpi=100)
             self.cv_axes = figure.add_subplot(111)
             self.cv_axes.set_xlabel("Voltage / V")
@@ -30,8 +54,7 @@ class AutomaticLivePlot(tk.Toplevel):
             self.cv_canvas = FigureCanvasTkAgg(figure, master=frame)
             self.cv_canvas.get_tk_widget().pack(fill="both", expand=True)
         if show_eis:
-            frame = ttk.Frame(notebook)
-            notebook.add(frame, text="EIS / GetRu")
+            frame = plot_frame("EIS / GetRu")
             figure = Figure(figsize=(8.5, 5.5), dpi=100)
             self.nyquist_axes = figure.add_subplot(221)
             self.bode_axes = figure.add_subplot(222)
@@ -47,8 +70,7 @@ class AutomaticLivePlot(tk.Toplevel):
             self.eis_canvas = FigureCanvasTkAgg(figure, master=frame)
             self.eis_canvas.get_tk_widget().pack(fill="both", expand=True)
         if show_ca:
-            frame = ttk.Frame(notebook)
-            notebook.add(frame, text="CA")
+            frame = plot_frame("CA")
             figure = Figure(figsize=(7.5, 5.5), dpi=100)
             self.ca_axes = figure.add_subplot(111)
             self.ca_axes.set_xlabel("Time / s")
@@ -69,9 +91,10 @@ class AutomaticLivePlot(tk.Toplevel):
         voltage = "vf" if "vf" in names else ("vu" if "vu" in names else None)
         if voltage is None or "im" not in names:
             return
-        self.cv_line.set_data(np.asarray(data[voltage], float), np.asarray(data["im"], float))
-        self.cv_axes.relim()
-        self.cv_axes.autoscale_view()
+        voltage_values = np.asarray(data[voltage], float)
+        current_values = np.asarray(data["im"], float)
+        self.cv_line.set_data(voltage_values, current_values)
+        autoscale_cv_axes(self.cv_axes, voltage_values, current_values)
         self.cv_canvas.draw_idle()
 
     def clear_eis(self):
@@ -123,3 +146,33 @@ class AutomaticLivePlot(tk.Toplevel):
         self.ca_axes.relim()
         self.ca_axes.autoscale_view()
         self.ca_canvas.draw_idle()
+
+
+class SeparateEISVoltammetryPlots:
+    """Keep EIS and CV/LSV plots in independent, hideable windows."""
+
+    def __init__(self, parent, voltammetry_label="CV"):
+        self.eis = AutomaticLivePlot(parent, show_eis=True)
+        self.voltammetry = AutomaticLivePlot(
+            parent, show_cv=True, voltammetry_label=voltammetry_label
+        )
+
+    def deiconify(self):
+        self.eis.deiconify()
+        self.voltammetry.deiconify()
+
+    def destroy(self):
+        self.eis.destroy()
+        self.voltammetry.destroy()
+
+    def clear_eis(self):
+        self.eis.clear_eis()
+
+    def update_eis_csv(self, csv_path):
+        self.eis.update_eis_csv(csv_path)
+
+    def clear_cv(self):
+        self.voltammetry.clear_cv()
+
+    def update_cv(self, data):
+        self.voltammetry.update_cv(data)
